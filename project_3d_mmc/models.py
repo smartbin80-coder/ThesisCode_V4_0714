@@ -1,5 +1,7 @@
 """Physics-biased GAT models for MMC component step prediction."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +29,8 @@ class PhysicsBiasedGATLayer(nn.Module):
         self.att_dst = nn.Parameter(torch.empty(self.heads, self.head_dim))
         self.att_edge = nn.Parameter(torch.empty(self.heads, self.head_dim))
         self.bias = nn.Parameter(torch.zeros(self.out_channels))
-        self.alpha = nn.Parameter(torch.tensor(float(prior_alpha_init), dtype=torch.float32))
+        self.alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.prior_alpha_init = float(prior_alpha_init)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -39,7 +42,13 @@ class PhysicsBiasedGATLayer(nn.Module):
         nn.init.xavier_uniform_(self.att_edge)
         nn.init.zeros_(self.bias)
         with torch.no_grad():
-            self.alpha.fill_(0.1)
+            init = min(max(self.prior_alpha_init, 0.100001), 0.999999)
+            raw_init = math.log((init - 0.1) / (1.0 - init))
+            self.alpha.fill_(raw_init)
+
+    def actual_alpha(self):
+        """Return the non-negative physical-prior scale in [0.1, 1.0]."""
+        return 0.1 + 0.9 * torch.sigmoid(self.alpha)
 
     def forward(self, x, edge_index, edge_attr, edge_load_prior=None):
         """Apply physics-biased attention message passing."""
@@ -61,7 +70,7 @@ class PhysicsBiasedGATLayer(nn.Module):
         if edge_load_prior is None:
             edge_load_prior = edge_attr.new_zeros((edge_attr.size(0), 1))
         prior_bias = edge_load_prior.view(-1, 1).to(dtype=learned_logit.dtype, device=learned_logit.device)
-        attention_logit = learned_logit + self.alpha * prior_bias
+        attention_logit = learned_logit + self.actual_alpha() * prior_bias
         attn = softmax(attention_logit, dst, num_nodes=num_nodes)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from config import config as base_config
 from models import MMCStepGAT
 from pyg_dataset import create_dataloader
 
@@ -55,6 +56,33 @@ def compute_step_losses(outputs, data, response_weight=0.1, class_weight=0.1, gr
     return total, losses
 
 
+def alpha_parameters(model):
+    """Return all physics-prior alpha parameters in GAT layers."""
+    return [param for name, param in model.named_parameters() if name.endswith(".alpha")]
+
+
+def non_alpha_parameters(model):
+    """Return trainable parameters except physics-prior alpha scalars."""
+    alpha_ids = {id(param) for param in alpha_parameters(model)}
+    return [param for param in model.parameters() if id(param) not in alpha_ids]
+
+
+def set_alpha_trainable(model, trainable):
+    """Freeze or release physics-prior alpha parameters."""
+    for param in alpha_parameters(model):
+        param.requires_grad_(bool(trainable))
+
+
+def build_optimizer(model, lr, alpha_weight_decay, optimizer_cls=torch.optim.Adam):
+    """Build optimizer with a dedicated weight-decay group for alpha."""
+    return optimizer_cls(
+        [
+            {"params": non_alpha_parameters(model), "lr": lr},
+            {"params": alpha_parameters(model), "lr": lr, "weight_decay": float(alpha_weight_decay)},
+        ]
+    )
+
+
 def train_epoch(model, loader, optimizer, device):
     """Train one epoch."""
     model.train()
@@ -91,6 +119,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--alpha-weight-decay", type=float, default=base_config.alpha_weight_decay)
+    parser.add_argument("--alpha-freeze-epochs", type=int, default=base_config.alpha_freeze_epochs)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -116,10 +146,11 @@ def main():
         num_layers=args.num_layers,
         response_candidates=args.response_candidates,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = build_optimizer(model, args.lr, args.alpha_weight_decay)
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
+        set_alpha_trainable(model, epoch > args.alpha_freeze_epochs)
         train_loss = train_epoch(model, train_loader, optimizer, device)
         val_loss = evaluate(model, val_loader, device) if val_loader is not None else train_loss
         if val_loss <= best_val:

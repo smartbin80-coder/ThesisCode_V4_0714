@@ -241,6 +241,8 @@ loader = create_dataloader("dataset", batch_size=8)
 python train_gnn_step.py --dataset-dir dataset --epochs 50 --batch-size 8
 ```
 
+物理先验注意力使用非负约束：实际缩放为 `actual_alpha = 0.1 + 0.9 * sigmoid(raw_alpha)`，始终位于 `[0.1, 1.0]`。`raw_alpha` 默认前 20 个 epoch 冻结，使 `actual_alpha` 贴近 `0.1`；之后释放训练，并使用单独的 `alpha_weight_decay = 1e-4`。可通过 `--alpha-freeze-epochs` 和 `--alpha-weight-decay` 覆盖。
+
 MAML 风格元学习预训练：
 
 ```bash

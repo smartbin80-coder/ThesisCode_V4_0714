@@ -9,9 +9,10 @@ from pathlib import Path
 import torch
 from torch_geometric.data import Batch
 
+from config import config as base_config
 from models import MMCStepGAT
 from pyg_dataset import MMCStepDataset
-from train_gnn_step import compute_step_losses
+from train_gnn_step import build_optimizer, compute_step_losses, set_alpha_trainable
 
 
 def group_indices_by_trajectory(dataset):
@@ -54,10 +55,11 @@ def regularization_loss(model):
     return reg if reg is not None else torch.tensor(0.0)
 
 
-def adapt_on_support(model, support_batch, inner_lr=1e-3, inner_steps=2):
+def adapt_on_support(model, support_batch, inner_lr=1e-3, inner_steps=2, alpha_trainable=True, alpha_weight_decay=1e-4):
     """Adapt a copied model on support data for first-order MAML training."""
     adapted = copy.deepcopy(model)
-    optimizer = torch.optim.SGD(adapted.parameters(), lr=inner_lr)
+    set_alpha_trainable(adapted, alpha_trainable)
+    optimizer = build_optimizer(adapted, inner_lr, 0.0, optimizer_cls=torch.optim.SGD)
     for _ in range(inner_steps):
         optimizer.zero_grad()
         support_outputs = adapted(support_batch)
@@ -79,6 +81,8 @@ def first_order_maml_epoch(
     inner_lr=1e-3,
     inner_steps=2,
     lambda_reg=1e-5,
+    alpha_trainable=True,
+    alpha_weight_decay=1e-4,
 ):
     """Run one first-order MAML-style epoch with explicit support/query loss."""
     model.train()
@@ -88,7 +92,14 @@ def first_order_maml_epoch(
         support_batch = make_batch(dataset, support_idx, device)
         query_batch = make_batch(dataset, query_idx, device)
 
-        adapted = adapt_on_support(model, support_batch, inner_lr=inner_lr, inner_steps=inner_steps)
+        adapted = adapt_on_support(
+            model,
+            support_batch,
+            inner_lr=inner_lr,
+            inner_steps=inner_steps,
+            alpha_trainable=alpha_trainable,
+            alpha_weight_decay=alpha_weight_decay,
+        )
         support_outputs = model(support_batch)
         support_loss, _ = compute_step_losses(support_outputs, support_batch)
         query_outputs = adapted(query_batch)
@@ -119,6 +130,8 @@ def parse_args():
     parser.add_argument("--inner-steps", type=int, default=2)
     parser.add_argument("--meta-lr", type=float, default=5e-4)
     parser.add_argument("--lambda-reg", type=float, default=1e-5)
+    parser.add_argument("--alpha-weight-decay", type=float, default=base_config.alpha_weight_decay)
+    parser.add_argument("--alpha-freeze-epochs", type=int, default=base_config.alpha_freeze_epochs)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -143,8 +156,10 @@ def main():
         num_layers=args.num_layers,
         response_candidates=args.response_candidates,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.meta_lr)
+    optimizer = build_optimizer(model, args.meta_lr, args.alpha_weight_decay)
     for epoch in range(1, args.epochs + 1):
+        alpha_trainable = epoch > args.alpha_freeze_epochs
+        set_alpha_trainable(model, alpha_trainable)
         loss = first_order_maml_epoch(
             model,
             dataset,
@@ -157,6 +172,8 @@ def main():
             inner_lr=args.inner_lr,
             inner_steps=args.inner_steps,
             lambda_reg=args.lambda_reg,
+            alpha_trainable=alpha_trainable,
+            alpha_weight_decay=args.alpha_weight_decay,
         )
         torch.save({"model_state": model.state_dict(), "args": vars(args)}, args.checkpoint)
         print(f"epoch={epoch:04d} meta_loss={loss:.6e}")

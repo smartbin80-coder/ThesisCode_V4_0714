@@ -667,6 +667,8 @@ print(sample.x.shape, sample.edge_index.shape, sample.y)
 python train_gnn_step.py --dataset-dir dataset --epochs 50 --batch-size 8
 ```
 
+注意力物理先验缩放使用非负约束：实际缩放为 `actual_alpha = 0.1 + 0.9 * sigmoid(raw_alpha)`，始终位于 `[0.1, 1.0]`。`raw_alpha` 默认前 20 个 epoch 冻结，使 `actual_alpha` 贴近 `0.1`；之后释放训练，并通过 `alpha_weight_decay = 1e-4` 单独正则。MAML support 内循环使用 SGD 且不对 `raw_alpha` 施加 weight decay。
+
 MAML 风格元学习：
 
 ```bash

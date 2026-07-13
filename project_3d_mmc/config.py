@@ -53,6 +53,8 @@ class Config:
     eta_candidates: tuple = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
     feature_schema_version: int = 2
     load_prior_lambda: float = 2.0
+    alpha_weight_decay: float = 1e-4
+    alpha_freeze_epochs: int = 20
     trust_bias_eps: float = 1e-12
     trust_bias_threshold: float = 0.10
     node_step_label_mode: str = "global_broadcast"
