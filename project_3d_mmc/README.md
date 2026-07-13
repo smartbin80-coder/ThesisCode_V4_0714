@@ -219,6 +219,7 @@ component_strain_energy_norm
 - 主输出：组件级连续步长 `eta_node_label`
 - 图级辅助输出：连续最优步长 `eta_label`
 - 辅助输出：`eta_label_index`, `eta_failure_flag`, `response_targets`
+- 分类辅助损失只在 `eta_failure_flag = 0` 的样本上计算；候选全部失败时不把 `eta_label_index = -1` 强行映射到 0 类。
 
 如果所有候选步长都违反体积约束：
 

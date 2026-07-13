@@ -489,6 +489,8 @@ load_z
 - 辅助回归：预测 `response_targets`
 - 异常分类：预测 `eta_failure_flag`
 
+训练时要注意：`eta_label_index = -1` 表示全部候选步长失败，不能用 `clamp(min=0)` 把它当成 0 类。当前 `compute_step_losses` 会用 `eta_failure_flag` 屏蔽这些样本的节点/图级分类损失，只保留回归和响应辅助损失。
+
 ## 14. `pyg_dataset.py`: PyTorch Geometric 数据加载
 
 该文件将 `.npz` 图文件加载为 PyG `Data` 对象。

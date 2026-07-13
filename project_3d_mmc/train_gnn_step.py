@@ -25,16 +25,50 @@ def normalize_response_targets(response_targets):
     return out
 
 
+def _zero_loss_like(tensor):
+    """Return a differentiable zero on the same device as tensor."""
+    return tensor.sum() * 0.0
+
+
+def _classification_losses(outputs, data):
+    """Compute class losses only for graphs whose candidate eta search succeeded."""
+    device = outputs["node_eta_logits"].device
+    failure_flag = getattr(data, "eta_failure_flag", None)
+    if failure_flag is None:
+        graph_valid_mask = torch.ones(outputs["graph_eta_logits"].size(0), dtype=torch.bool, device=device)
+    else:
+        graph_valid_mask = failure_flag.view(-1).to(device=device).long() == 0
+
+    batch = getattr(data, "batch", None)
+    if batch is None:
+        node_valid_mask = graph_valid_mask
+    else:
+        node_valid_mask = graph_valid_mask[batch.to(device=device)]
+
+    if torch.any(node_valid_mask):
+        node_label_index = data.eta_node_label_index.to(device=device).long()[node_valid_mask]
+        node_label_index = node_label_index.clamp(min=0, max=outputs["node_eta_logits"].size(1) - 1)
+        node_class = F.cross_entropy(outputs["node_eta_logits"][node_valid_mask], node_label_index)
+    else:
+        node_class = _zero_loss_like(outputs["node_eta_logits"])
+
+    if torch.any(graph_valid_mask):
+        graph_label_index = data.eta_label_index.view(-1).to(device=device).long()[graph_valid_mask]
+        graph_label_index = graph_label_index.clamp(min=0, max=outputs["graph_eta_logits"].size(1) - 1)
+        graph_class = F.cross_entropy(outputs["graph_eta_logits"][graph_valid_mask], graph_label_index)
+    else:
+        graph_class = _zero_loss_like(outputs["graph_eta_logits"])
+
+    return node_class, graph_class
+
+
 def compute_step_losses(outputs, data, response_weight=0.1, class_weight=0.1, graph_weight=0.2):
     """Compute node, graph, class, and response supervision losses."""
     losses = {}
     losses["node_eta"] = F.mse_loss(outputs["node_eta_pred"], data.eta_node_label.float())
     losses["graph_eta"] = F.mse_loss(outputs["graph_eta_pred"], data.eta_label.view(-1).float())
 
-    node_label_index = data.eta_node_label_index.long().clamp(min=0, max=outputs["node_eta_logits"].size(1) - 1)
-    graph_label_index = data.eta_label_index.view(-1).long().clamp(min=0, max=outputs["graph_eta_logits"].size(1) - 1)
-    losses["node_class"] = F.cross_entropy(outputs["node_eta_logits"], node_label_index)
-    losses["graph_class"] = F.cross_entropy(outputs["graph_eta_logits"], graph_label_index)
+    losses["node_class"], losses["graph_class"] = _classification_losses(outputs, data)
 
     num_graphs = _graph_count(data)
     response_pred = outputs["response_pred"]

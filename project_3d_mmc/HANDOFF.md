@@ -238,6 +238,8 @@ python train_gnn_step.py --dataset-dir dataset_train_100 --epochs 50 --batch-siz
 
 注意：响应目标中 compliance 已在训练损失内用 `log1p` 缩放，避免数值爆炸。
 
+重要：`eta_label_index = -1` 表示全部候选步长失败，不能被 `clamp(min=0)` 当成 0 类训练。当前 `compute_step_losses` 会用 `eta_failure_flag` 屏蔽失败样本的节点/图级分类损失，只保留回归和响应辅助损失。
+
 ## 9. MAML 元学习接口
 
 命令示例：
@@ -302,9 +304,10 @@ SafetyDampingController
    - raw alpha = -100 时，`actual_alpha` 仍约为 0.1。
    - raw alpha = 100 时，`actual_alpha` 约为 1.0。
 7. MAML support 内循环 SGD 参数组 weight decay 为 `[0, 0.0]`。
-8. 普通训练 smoke 1 epoch 跑通。
-9. MAML smoke 1 epoch 跑通。
-10. 在线控制器 smoke test 跑通，安全回退后阻尼序列为 `0.8, 0.8, 0.8, 1.0`。
+8. 失败样本分类掩码定向验证通过：当 `eta_failure_flag = 1` 且 label index 为 `-1` 时，`node_class = 0`、`graph_class = 0`。
+9. 普通训练 smoke 1 epoch 跑通。
+10. MAML smoke 1 epoch 跑通。
+11. 在线控制器 smoke test 跑通，安全回退后阻尼序列为 `0.8, 0.8, 0.8, 1.0`。
 
 ## 12. 当前未完成和风险
 
@@ -368,5 +371,6 @@ SafetyDampingController
    - `HANDOFF.md`
 5. 物理先验注意力必须保持正向，不要再改回裸 `alpha * edge_load_prior_bias`。
 6. MAML support 内循环不要对 `raw_alpha` 加 weight decay。
-7. GAT 只允许预测步长缩放，不允许替代 FEM 或灵敏度方向。
-8. 所有在线预测步长必须经 FEM 验证，不可靠时必须回退到保守候选搜索。
+7. `eta_label_index = -1` 是失败标记，不要在分类损失里强行 clamp 成 0 类。
+8. GAT 只允许预测步长缩放，不允许替代 FEM 或灵敏度方向。
+9. 所有在线预测步长必须经 FEM 验证，不可靠时必须回退到保守候选搜索。
