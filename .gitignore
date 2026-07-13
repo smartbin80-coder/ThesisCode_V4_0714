@@ -1,0 +1,22 @@
+# Ignore datasets and results
+dataset_schema_v2_smoke/
+results_schema_v2_smoke/
+batch_test/
+results/
+upload_ThesisCode_V3_0709/
+dataset_*/
+results_*/
+
+# Ignore Python caches and compiled files
+**__pycache__/
+*.pyc
+*.pyo
+
+# Ignore logs and temporary numeric artifacts
+*.log
+*.npz
+*.npy
+
+# Ignore virtual environments
+venv/
+env/
