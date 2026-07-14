@@ -587,3 +587,37 @@ Final `1 x 50` result:
 - Compliance improved from `114.65327441733338` to `103.88421390338605`.
 - Volume fraction changed from `0.39235007472465117` to `0.3818868275336585`.
 - Final paper-style image: `D:\codex\workspace_code_v2\results_domain60_connected_1x50\traj_0000\process_plots\final_isosurface_iter_0050.png`.
+
+## 2026-07-14 Random Initialization Connectivity Repair
+
+The user requirement changed to preserving randomized initial MMC layouts while still converging to a continuous cantilever load path. A fixed beam skeleton is not acceptable for this goal.
+
+Implemented changes:
+- `create_random_components(config, rng)` now uses x-covered random initialization: the domain is split into `random_cover_segments=6`, with 24 components distributed as 4 randomized components per segment.
+- `config.py` adds connection-control parameters:
+  - `connectivity_density_threshold = 0.4`
+  - `connection_penalty_initial = 1000.0`
+  - `connection_penalty_final = 5.0`
+  - `connection_penalty_decay_fraction = 0.6`
+  - `volume_fill_weight = 200000.0`
+- `optimizer.py` now augments the MMA objective with:
+  - `connection_gap_penalty`, based on the minimum positive-gap path from the fixed face to the load point.
+  - `volume_fill_penalty`, active when volume fraction is below `volfrac`.
+- `_accept_mma_step()` now evaluates an additional connection-repair candidate when the current density field is not connected. This candidate slightly moves and thickens components along the minimum-gap path, then still goes through projection, FEM evaluation, volume checking, and connectivity ranking.
+- Connectivity diagnostics now use `connectivity_density_threshold`, while process plots and isosurfaces remain visualized from the actual density/TDF fields.
+
+Validation command:
+```powershell
+python -B generate_dataset.py --num-trajectories 1 --max-iter 50 --output-dir D:\codex\workspace_code_v2\dataset_connected_random_verified_1x50 --results-dir D:\codex\workspace_code_v2\results_connected_random_verified_1x50
+```
+
+Final verified result:
+- Graph samples: `51`.
+- Initial state: `connected_to_load=0`, `spanning_ratio=0.0`, `gap=4.3122`, `volume_fraction=0.2382`, `compliance=2889.33`.
+- Final state: `connected_to_load=1`, `spanning_ratio=1.0`, `largest_component_ratio=1.0`, `gap=0.1645`, `volume_fraction=0.3139`, `compliance=1028.27`.
+- Final isosurface image: `D:\codex\workspace_code_v2\results_connected_random_verified_1x50\traj_0000\process_plots\final_isosurface_iter_0050.png`.
+
+Important interpretation:
+- This does not fake cylindrical members or draw artificial bridges.
+- The final image is still extracted from the true global implicit boundary `phi=0`.
+- The repair candidate is an optimization candidate, not a visualization patch.

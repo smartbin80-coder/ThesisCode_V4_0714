@@ -52,8 +52,16 @@ class Config:
     save_graph: bool = True
     save_process_plots: bool = True
     process_plot_density_threshold: float = 0.5
+    connectivity_density_threshold: float = 0.4
     isosurface_resolution: tuple = (240, 24, 80)
     eta_candidates: tuple = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+    random_cover_segments: int = 6
+    connection_penalty_initial: float = 1000.0
+    connection_penalty_final: float = 5.0
+    connection_penalty_decay_fraction: float = 0.6
+    connection_gap_softplus_beta: float = 4.0
+    connection_gap_weight: float = 1.0
+    volume_fill_weight: float = 200000.0
     feature_schema_version: int = 2
     load_prior_lambda: float = 2.0
     alpha_weight_decay: float = 1e-4

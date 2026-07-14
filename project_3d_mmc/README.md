@@ -119,7 +119,21 @@ center + half_extent <= [DL, DW, DH]
 
 ## 初始化策略
 
-当前批量数据生成使用 24 个随机分散、严格域内可行的 MMC 组件。近期 1 条 50 步随机分散实验表明，完全随机撒点通常不能形成从固定端到载荷端的连续传力路径，最终等值面仍呈分散块状。因此，正式训练数据建议采用“悬臂梁专用随机初始化”：保留随机性，但需要保证固定端、载荷端和中间桥接区域有基本覆盖。
+当前批量数据生成使用 24 个随机、严格域内可行的 MMC 组件。为避免完全自由撒点造成大空洞，初始化采用 `x` 方向分区覆盖随机：默认将 `DL=60` 沿长度方向分成 6 段，每段随机生成 4 个组件。组件中心、尺度和角度仍然随机，因此不是固定桁架骨架。
+
+优化阶段增加了三项连接稳定机制：
+
+- `connection_gap_penalty`：在固定端到载荷端的最小 gap 路径上惩罚组件间未搭接间隙。
+- `volume_fill_penalty`：体积分数低于目标时鼓励保留材料，避免随机组件在成桥阶段过度稀疏。
+- connection repair candidate：当前结构未连通时，额外生成一个沿最小 gap 路径轻微平移和加厚组件的真实几何候选，并经过 FEM、体积和连通性评估后才可能接受。
+
+连通性诊断使用独立阈值：
+
+```python
+connectivity_density_threshold = 0.4
+```
+
+绘图仍从真实全局隐式边界 `phi = 0` 提取等值面，不通过绘图伪造连接。
 
 ## 过程图与论文式等值面
 
@@ -214,6 +228,7 @@ python -B test_online_step.py --dataset-dir dataset --results-dir results/online
 - 旋转后 MMC 组件严格限制在 `60 x 4 x 20` 设计域内。
 - 隐式等值面绘图可输出论文式红色拓扑表面。
 - 连接性诊断字段 `connected_to_load`, `spanning_ratio`, `largest_component_ratio` 已写入图样本。
+- 随机初始布局 `1 x 50` 验证已形成完整传力路径：最终 `connected_to_load=1`, `spanning_ratio=1.0`, `volume_fraction=0.3139`, `compliance` 从 `2889.33` 降到 `1028.27`。
 
 ## 当前限制
 

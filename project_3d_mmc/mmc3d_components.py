@@ -188,13 +188,20 @@ def create_initial_components(config):
 
 
 def create_random_components(config, rng):
-    """Generate randomized, scattered, strictly domain-feasible MMC components."""
+    """Generate randomized, x-covered, strictly domain-feasible MMC components."""
     comps = []
     min_l = 0.7 * min(config.DL / config.nelx, config.DW / config.nely, config.DH / config.nelz)
     domain = _domain_size(config)
-    for _ in range(config.num_components):
+    n_segments = max(1, int(getattr(config, "random_cover_segments", 6)))
+    segment_ids = np.arange(config.num_components) % n_segments
+    rng.shuffle(segment_ids)
+    segment_width = config.DL / n_segments
+
+    for segment_id in segment_ids:
+        x_low = float(segment_id * segment_width)
+        x_high = float((segment_id + 1) * segment_width)
         for _attempt in range(160):
-            L1 = rng.uniform(max(min_l, 0.05 * config.DL), 0.16 * config.DL)
+            L1 = rng.uniform(max(min_l, 0.06 * config.DL), 0.18 * config.DL)
             L2 = rng.uniform(max(min_l, 0.06 * config.DW), 0.18 * config.DW)
             L3 = rng.uniform(max(min_l, 0.04 * config.DH), 0.16 * config.DH)
             alpha = rng.uniform(-0.18 * np.pi, 0.18 * np.pi)
@@ -203,16 +210,35 @@ def create_random_components(config, rng):
             trial = MMCComponent3D(0.0, 0.0, 0.0, L1, L2, L3, alpha, beta, gamma)
             half = component_half_extent(trial)
             if np.all(half < 0.5 * domain):
-                low = half
-                high = domain - half
-                center = rng.uniform(low, high)
+                x0_low = max(half[0], x_low)
+                x0_high = min(domain[0] - half[0], x_high)
+                if x0_low > x0_high:
+                    x0_low = half[0]
+                    x0_high = domain[0] - half[0]
+                y_low = max(half[1], 0.20 * config.DW)
+                y_high = min(domain[1] - half[1], 0.80 * config.DW)
+                z_low = max(half[2], 0.12 * config.DH)
+                z_high = min(domain[2] - half[2], 0.88 * config.DH)
+                if y_low > y_high:
+                    y_low, y_high = half[1], domain[1] - half[1]
+                if z_low > z_high:
+                    z_low, z_high = half[2], domain[2] - half[2]
+                center = np.array(
+                    [
+                        rng.uniform(x0_low, x0_high),
+                        rng.uniform(y_low, y_high),
+                        rng.uniform(z_low, z_high),
+                    ],
+                    dtype=float,
+                )
                 comps.append(MMCComponent3D(center[0], center[1], center[2], L1, L2, L3, alpha, beta, gamma))
                 break
         else:
             L1 = rng.uniform(max(min_l, 0.04 * config.DL), 0.08 * config.DL)
             L2 = rng.uniform(max(min_l, 0.05 * config.DW), 0.12 * config.DW)
             L3 = rng.uniform(max(min_l, 0.04 * config.DH), 0.10 * config.DH)
-            center = rng.uniform(0.35 * domain, 0.65 * domain)
+            x_center = rng.uniform(max(0.0, x_low), min(domain[0], x_high))
+            center = np.array([x_center, rng.uniform(0.25 * domain[1], 0.75 * domain[1]), rng.uniform(0.20 * domain[2], 0.80 * domain[2])])
             trial = MMCComponent3D(center[0], center[1], center[2], L1, L2, L3)
             comps.append(project_component_to_domain(trial, config, min_l=min_l))
     return comps

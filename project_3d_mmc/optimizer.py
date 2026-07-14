@@ -1,6 +1,7 @@
 """3D-MMC optimizer with analytic sensitivities, MMA, and GNN step labels."""
 
 from pathlib import Path
+import heapq
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure, label
@@ -16,7 +17,7 @@ from fem3d import (
 )
 from graph_export import build_component_graph, build_component_step_labels, build_graph_auxiliary_features, save_graph_npz
 from mma import MMASolver
-from mmc3d_components import components_to_params, get_bounds, params_to_components, project_params_to_domain
+from mmc3d_components import component_half_extent, components_to_params, get_bounds, params_to_components, project_params_to_domain
 from tdf import compute_density_with_sensitivities, compute_element_density_from_tdf, compute_global_tdf, compute_global_tdf_with_sensitivities
 from utils import ensure_dir, save_json
 from visualization import plot_topology_isosurface, plot_topology_process
@@ -91,13 +92,27 @@ class MMCOptimizer3D:
         compliance_grad = dcompliance_drho @ drho_dparams
         volume_grad = np.mean(drho_dparams, axis=0)
         element_strain_energy = compute_element_strain_energy(U, self.elements, self.ke, densities)
+        gap_penalty, gap_grad, gap_path = self._connection_gap_penalty_and_grad(comps)
+        lambda_conn = self._connection_penalty_weight()
+        volume_deficit = max(0.0, float(self.config.volfrac) - float(volume_fraction))
+        volume_fill_weight = float(getattr(self.config, "volume_fill_weight", 0.0))
+        volume_fill_penalty = volume_fill_weight * volume_deficit * volume_deficit
+        objective_value = float(compliance + lambda_conn * gap_penalty + volume_fill_penalty)
+        objective_grad = np.asarray(compliance_grad, dtype=float) + lambda_conn * np.asarray(gap_grad, dtype=float)
+        if volume_deficit > 0.0 and volume_fill_weight > 0.0:
+            objective_grad -= 2.0 * volume_fill_weight * volume_deficit * np.asarray(volume_grad, dtype=float)
 
         out = {
+            "objective": objective_value,
             "compliance": float(compliance),
             "volume_fraction": float(volume_fraction),
             "densities": densities,
             "U": U,
             "components": comps,
+            "connection_gap_penalty": float(gap_penalty),
+            "connection_gap_path": np.asarray(gap_path, dtype=int),
+            "connection_penalty_weight": float(lambda_conn),
+            "volume_fill_penalty": float(volume_fill_penalty),
             "element_strain_energy": element_strain_energy,
             "component_strain_energy_norm": self._component_strain_energy_norm(densities, drho_dparams, element_strain_energy),
             "connectivity": self._connectivity_metrics(densities),
@@ -111,6 +126,7 @@ class MMCOptimizer3D:
                 volume_fraction=volume_fraction,
             ),
             "compliance_grad": np.asarray(compliance_grad, dtype=float),
+            "objective_grad": np.asarray(objective_grad, dtype=float),
             "volume_grad": np.asarray(volume_grad, dtype=float),
         }
         self._cache_params = params.copy()
@@ -119,11 +135,11 @@ class MMCOptimizer3D:
 
     def objective(self, params):
         """SLSQP objective."""
-        return self.evaluate_with_sensitivities(params)["compliance"]
+        return self.evaluate_with_sensitivities(params)["objective"]
 
     def objective_jac(self, params):
         """Analytic objective gradient for SLSQP."""
-        return self.evaluate_with_sensitivities(params)["compliance_grad"]
+        return self.evaluate_with_sensitivities(params)["objective_grad"]
 
     def constraint_volume(self, params):
         """SLSQP volume constraint: non-negative means feasible."""
@@ -236,7 +252,8 @@ class MMCOptimizer3D:
 
         print(
             f"iter {self.iteration:04d} | compliance={compliance:.6e} | "
-            f"volume={volume_fraction:.4f} | constraint={self.config.volfrac - volume_fraction:.4f} | eta_label={eta_label:.2f}"
+            f"volume={volume_fraction:.4f} | constraint={self.config.volfrac - volume_fraction:.4f} | "
+            f"gap={eval_data['connection_gap_penalty']:.4e} | eta_label={eta_label:.2f}"
         )
 
         if self.config.save_graph:
@@ -267,6 +284,10 @@ class MMCOptimizer3D:
                 "trust_predicted_delta": trust_predicted_delta,
                 "trust_bias": trust_bias,
                 "component_strain_energy_norm": eval_data["component_strain_energy_norm"],
+                "connection_gap_penalty": float(eval_data["connection_gap_penalty"]),
+                "connection_penalty_weight": float(eval_data["connection_penalty_weight"]),
+                "connection_gap_path": eval_data["connection_gap_path"],
+                "volume_fill_penalty": float(eval_data["volume_fill_penalty"]),
                 "connected_to_load": int(eval_data["connectivity"]["connected_to_load"]),
                 "spanning_ratio": float(eval_data["connectivity"]["spanning_ratio"]),
                 "largest_component_ratio": float(eval_data["connectivity"]["largest_component_ratio"]),
@@ -318,7 +339,13 @@ class MMCOptimizer3D:
             return
         out_dir = Path(self.config.results_dir) / "process_plots"
         ensure_dir(out_dir)
-        threshold = float(getattr(self.config, "process_plot_density_threshold", 0.5))
+        threshold = float(
+            getattr(
+                self.config,
+                "connectivity_density_threshold",
+                getattr(self.config, "process_plot_density_threshold", 0.5),
+            )
+        )
         title = f"{stage.capitalize()} topology | iter {self.iteration:04d}"
         component_path = out_dir / f"{stage}_components_iter_{self.iteration:04d}.png"
         isosurface_path = out_dir / f"{stage}_isosurface_iter_{self.iteration:04d}.png"
@@ -362,7 +389,7 @@ class MMCOptimizer3D:
         for _ in range(self.config.max_iter):
             data = self.evaluate_with_sensitivities(x)
             g = data["volume_fraction"] - self.config.volfrac
-            raw = self._project_params(solver.update(x, data["compliance"], data["compliance_grad"], g, data["volume_grad"]))
+            raw = self._project_params(solver.update(x, data["objective"], data["objective_grad"], g, data["volume_grad"]))
             xnew = self._accept_mma_step(x, raw, data)
             change = float(np.max(np.abs(xnew - x)))
             x = xnew
@@ -381,6 +408,7 @@ class MMCOptimizer3D:
         old_v = current_data["volume_fraction"]
         old_c = current_data["compliance"]
         old_connectivity = current_data.get("connectivity", {"connected_to_load": False, "spanning_ratio": 0.0})
+        old_gap = float(current_data.get("connection_gap_penalty", self._connection_gap_penalty(x)))
         old_violation = max(0.0, old_v - self.config.volfrac)
         candidates = []
         eta_list = tuple(float(eta) for eta in self.config.eta_candidates) + (0.0,)
@@ -389,7 +417,15 @@ class MMCOptimizer3D:
             c_trial, v_trial, densities_trial, *_ = self.evaluate(trial)
             violation = max(0.0, v_trial - self.config.volfrac)
             connectivity = self._connectivity_metrics(densities_trial)
-            candidates.append((eta, trial, c_trial, v_trial, violation, connectivity))
+            gap_trial = self._connection_gap_penalty(trial)
+            candidates.append((eta, trial, c_trial, v_trial, violation, connectivity, gap_trial))
+        if not bool(old_connectivity["connected_to_load"]):
+            repair = self._connection_repair_params(x)
+            c_trial, v_trial, densities_trial, *_ = self.evaluate(repair)
+            violation = max(0.0, v_trial - self.config.volfrac)
+            connectivity = self._connectivity_metrics(densities_trial)
+            gap_trial = self._connection_gap_penalty(repair)
+            candidates.append((-1.0, repair, c_trial, v_trial, violation, connectivity, gap_trial))
 
         def connectivity_loss(item):
             conn = item[5]
@@ -397,6 +433,12 @@ class MMCOptimizer3D:
             if bool(old_connectivity["connected_to_load"]) and not bool(conn["connected_to_load"]):
                 loss += 1.0
             return loss
+
+        def gap_loss(item):
+            return max(0.0, float(item[6]) - old_gap)
+
+        def volume_deficit(item):
+            return max(0.0, float(self.config.volfrac) - float(item[3]))
 
         def nonworse_connectivity(item):
             conn = item[5]
@@ -408,22 +450,38 @@ class MMCOptimizer3D:
 
         def connected_key(item):
             conn = item[5]
-            return (-int(bool(conn["connected_to_load"])), -float(conn["spanning_ratio"]), item[2])
+            return (-int(bool(conn["connected_to_load"])), -float(conn["spanning_ratio"]), item[6], volume_deficit(item), item[2])
 
         feasible = [item for item in candidates if item[4] <= 1e-8]
         if old_violation <= 1e-8 and feasible:
             nonworse = [item for item in feasible if nonworse_connectivity(item)]
-            eta, trial, *_ = min(nonworse or feasible, key=lambda item: (connectivity_loss(item), *connected_key(item)))
+            if bool(old_connectivity["connected_to_load"]):
+                connected = [item for item in feasible if bool(item[5]["connected_to_load"])]
+                eta, trial, *_ = min(
+                    connected or nonworse or feasible,
+                    key=lambda item: (connectivity_loss(item), gap_loss(item), *connected_key(item)),
+                )
+            else:
+                eta, trial, *_ = min(
+                    nonworse or feasible,
+                    key=lambda item: (gap_loss(item), item[6], connectivity_loss(item), *connected_key(item)),
+                )
             return trial
 
         positive_candidates = [item for item in candidates if item[0] > 0.0]
         improving_violation = [item for item in positive_candidates if item[4] <= old_violation + 1e-10]
         if improving_violation:
             nonworse = [item for item in improving_violation if nonworse_connectivity(item)]
-            eta, trial, *_ = min(nonworse or improving_violation, key=lambda item: (item[4], connectivity_loss(item), *connected_key(item)))
+            eta, trial, *_ = min(
+                nonworse or improving_violation,
+                key=lambda item: (item[4], gap_loss(item), item[6], connectivity_loss(item), *connected_key(item)),
+            )
             return trial
 
-        _, trial, *_ = min(positive_candidates or candidates, key=lambda item: (connectivity_loss(item), item[4], *connected_key(item)))
+        _, trial, *_ = min(
+            positive_candidates or candidates,
+            key=lambda item: (gap_loss(item), item[6], connectivity_loss(item), item[4], *connected_key(item)),
+        )
         return trial
 
     def _run_slsqp(self, x0):
@@ -459,10 +517,205 @@ class MMCOptimizer3D:
         projected = project_params_to_domain(params, self.components, self.config)
         return np.asarray(projected, dtype=float)
 
+    def _connection_penalty_weight(self):
+        """Continuation schedule for the random-layout connection penalty."""
+        initial = float(getattr(self.config, "connection_penalty_initial", 50.0))
+        final = float(getattr(self.config, "connection_penalty_final", 1.0))
+        max_iter = max(1, int(getattr(self.config, "max_iter", 1)))
+        decay_fraction = float(getattr(self.config, "connection_penalty_decay_fraction", 0.7))
+        decay_steps = max(1.0, decay_fraction * max_iter)
+        t = min(1.0, max(0.0, float(self.iteration) / decay_steps))
+        return (1.0 - t) * initial + t * final
+
+    def _component_support_radius(self, component, direction):
+        """Approximate component reach along a global direction."""
+        d = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(d))
+        if norm <= 1e-12:
+            return 0.0
+        d = d / norm
+        q = d @ component.rotation_matrix()
+        lengths = np.maximum(np.array([component.L1, component.L2, component.L3], dtype=float), 1e-9)
+        p = max(2.0, float(self._tdf_p_norm()))
+        denom = float(np.sum(np.abs(q / lengths) ** p) ** (1.0 / p))
+        return 1.0 / max(denom, 1e-12)
+
+    def _edge_gap(self, comps, a, b):
+        """Return signed gap for one path edge; negative means overlap/reach."""
+        n = len(comps)
+        load = np.array([self.config.DL, float(getattr(self.config, "load_y", self.config.DW / 2)), float(getattr(self.config, "load_z", self.config.DH / 2))])
+        fixed = np.array([0.0, load[1], load[2]])
+        if a == -1 and 0 <= b < n:
+            half = component_half_extent(comps[b])
+            return float(comps[b].x0 - half[0])
+        if b == -1 and 0 <= a < n:
+            half = component_half_extent(comps[a])
+            return float(comps[a].x0 - half[0])
+        if a == -1:
+            ca = fixed
+            ra = 0.0
+        elif a == n:
+            ca = load
+            ra = 0.0
+        else:
+            ca = comps[a].center()
+            ra = None
+        if b == -1:
+            cb = fixed
+            rb = 0.0
+        elif b == n:
+            cb = load
+            rb = 0.0
+        else:
+            cb = comps[b].center()
+            rb = None
+        vec = cb - ca
+        dist = float(np.linalg.norm(vec))
+        if ra is None:
+            ra = self._component_support_radius(comps[a], vec)
+        if rb is None:
+            rb = self._component_support_radius(comps[b], -vec)
+        return dist - float(ra) - float(rb)
+
+    def _minimum_gap_path(self, comps):
+        """Find a left-to-right component chain with minimum positive gap."""
+        n = len(comps)
+        xs = np.array([comp.x0 for comp in comps], dtype=float)
+        adjacency = {-1: []}
+        for i in range(n):
+            adjacency[i] = []
+        for i in range(n):
+            gap = max(0.0, self._edge_gap(comps, -1, i))
+            adjacency[-1].append((gap, i))
+            gap_load = max(0.0, self._edge_gap(comps, i, n))
+            adjacency[i].append((gap_load, n))
+        for i in range(n):
+            for j in range(n):
+                if xs[j] <= xs[i] + 1e-9:
+                    continue
+                gap = max(0.0, self._edge_gap(comps, i, j))
+                distance_bias = 1e-4 * float(np.linalg.norm(comps[j].center() - comps[i].center())) / max(self.config.DL, 1e-9)
+                adjacency[i].append((gap + distance_bias, j))
+
+        heap = [(0.0, -1)]
+        prev = {}
+        best = {-1: 0.0}
+        while heap:
+            cost, node = heapq.heappop(heap)
+            if node == n:
+                break
+            if cost > best.get(node, np.inf) + 1e-12:
+                continue
+            for weight, nxt in adjacency.get(node, []):
+                new_cost = cost + float(weight)
+                if new_cost < best.get(nxt, np.inf):
+                    best[nxt] = new_cost
+                    prev[nxt] = node
+                    heapq.heappush(heap, (new_cost, nxt))
+        if n not in best:
+            return [(-1, n)]
+        nodes = [n]
+        while nodes[-1] != -1:
+            nodes.append(prev[nodes[-1]])
+        nodes.reverse()
+        return list(zip(nodes[:-1], nodes[1:]))
+
+    def _connection_gap_penalty_and_grad(self, comps):
+        """Penalty that pulls one random component chain into a continuous load path."""
+        n = len(comps)
+        grad = np.zeros(n * 9, dtype=float)
+        beta = float(getattr(self.config, "connection_gap_softplus_beta", 4.0))
+        weight = float(getattr(self.config, "connection_gap_weight", 1.0))
+        path = self._minimum_gap_path(comps)
+        penalty = 0.0
+        load = np.array([self.config.DL, float(getattr(self.config, "load_y", self.config.DW / 2)), float(getattr(self.config, "load_z", self.config.DH / 2))])
+        fixed = np.array([0.0, load[1], load[2]])
+
+        for a, b in path:
+            gap = self._edge_gap(comps, a, b)
+            soft = float(np.logaddexp(0.0, beta * gap) / beta)
+            sigmoid = float(1.0 / (1.0 + np.exp(-np.clip(beta * gap, -60.0, 60.0))))
+            penalty += weight * soft * soft
+            coeff = weight * 2.0 * soft * sigmoid
+            if coeff <= 1e-12:
+                continue
+            if a == -1:
+                ca = fixed
+            elif a == n:
+                ca = load
+            else:
+                ca = comps[a].center()
+            if b == -1:
+                cb = fixed
+            elif b == n:
+                cb = load
+            else:
+                cb = comps[b].center()
+            vec = cb - ca
+            dist = float(np.linalg.norm(vec))
+            if dist <= 1e-12:
+                continue
+            direction = vec / dist
+            if 0 <= a < n:
+                grad[9 * a : 9 * a + 3] -= coeff * direction
+            if 0 <= b < n:
+                grad[9 * b : 9 * b + 3] += coeff * direction
+        flat_path = []
+        for a, b in path:
+            flat_path.extend([a, b])
+        return float(penalty), grad, flat_path
+
+    def _connection_gap_penalty(self, params):
+        """Evaluate only the scalar connection gap penalty for candidate ranking."""
+        comps = params_to_components(self._project_params(params), self.components)
+        penalty, _, _ = self._connection_gap_penalty_and_grad(comps)
+        return float(penalty)
+
+    def _connection_repair_params(self, params):
+        """Build a geometry-repair candidate that closes gaps along the current load path."""
+        comps = params_to_components(self._project_params(params), self.components)
+        n = len(comps)
+        path = self._minimum_gap_path(comps)
+        new_params = np.asarray([comp.get_params() for comp in comps], dtype=float)
+        load = np.array([self.config.DL, float(getattr(self.config, "load_y", self.config.DW / 2)), float(getattr(self.config, "load_z", self.config.DH / 2))])
+        fixed = np.array([0.0, load[1], load[2]])
+        counts = np.ones(n, dtype=float)
+
+        for a, b in path:
+            gap = max(0.0, self._edge_gap(comps, a, b))
+            if gap <= 1e-9:
+                continue
+            ca = fixed if a == -1 else load if a == n else comps[a].center()
+            cb = fixed if b == -1 else load if b == n else comps[b].center()
+            vec = cb - ca
+            dist = float(np.linalg.norm(vec))
+            if dist <= 1e-12:
+                continue
+            direction = vec / dist
+            endpoint_edge = a in (-1, n) or b in (-1, n)
+            effective_gap = max(gap, 4.0 if endpoint_edge else 0.75)
+            shift = (0.65 if endpoint_edge else 0.40) * gap
+            grow = (0.45 if endpoint_edge else 0.18) * effective_gap
+            if 0 <= a < n:
+                new_params[a, 0:3] += shift * direction / counts[a]
+                new_params[a, 3:6] += grow * np.array([1.0, 0.35, 0.45])
+                counts[a] += 1.0
+            if 0 <= b < n:
+                new_params[b, 0:3] -= shift * direction / counts[b]
+                new_params[b, 3:6] += grow * np.array([1.0, 0.35, 0.45])
+                counts[b] += 1.0
+        return self._project_params(new_params.reshape(-1))
+
     def _connectivity_metrics(self, densities):
         """Measure whether the thresholded density connects the fixed side to the load side."""
         vals = np.asarray(densities, dtype=float).reshape(self.config.nelx, self.config.nely, self.config.nelz)
-        threshold = float(getattr(self.config, "process_plot_density_threshold", 0.5))
+        threshold = float(
+            getattr(
+                self.config,
+                "connectivity_density_threshold",
+                getattr(self.config, "process_plot_density_threshold", 0.5),
+            )
+        )
         solid = vals >= threshold
         if not np.any(solid):
             return {"connected_to_load": False, "spanning_ratio": 0.0, "largest_component_ratio": 0.0}
