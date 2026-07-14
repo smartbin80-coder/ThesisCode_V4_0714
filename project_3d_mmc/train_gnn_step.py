@@ -11,6 +11,10 @@ from models import MMCStepGAT
 from pyg_dataset import create_dataloader
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = PROJECT_DIR.parent
+
+
 def _graph_count(data):
     batch = getattr(data, "batch", None)
     if batch is None:
@@ -159,7 +163,7 @@ def parse_args():
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--response-candidates", type=int, default=6)
-    parser.add_argument("--checkpoint", type=str, default="gat_step_model.pt")
+    parser.add_argument("--checkpoint", type=str, default=str(WORKSPACE_DIR / "results_debug" / "gat_step_model.pt"))
     return parser.parse_args()
 
 
@@ -182,6 +186,7 @@ def main():
     ).to(device)
     optimizer = build_optimizer(model, args.lr, args.alpha_weight_decay)
 
+    Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         set_alpha_trainable(model, epoch > args.alpha_freeze_epochs)

@@ -1,5 +1,6 @@
 numpy
 scipy
 matplotlib
+scikit-image
 torch
 torch-geometric

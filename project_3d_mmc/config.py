@@ -12,14 +12,14 @@ class Config:
     """集中管理默认算例参数，默认规模面向普通电脑快速验证。"""
 
     # 设计域尺寸：长、宽、高
-    DL: float = 4.0
-    DW: float = 1.0
-    DH: float = 1.0
+    DL: float = 60.0
+    DW: float = 4.0
+    DH: float = 20.0
 
     # 六面体网格数量
-    nelx: int = 20
-    nely: int = 6
-    nelz: int = 6
+    nelx: int = 60
+    nely: int = 4
+    nelz: int = 20
 
     # 材料参数：实体弹性模量、弱材料模量、泊松比
     E0: float = 1.0
@@ -30,9 +30,9 @@ class Config:
     volfrac: float = 0.4
 
     # MMC 构件与 TDF 参数
-    num_components: int = 8
-    min_components_for_dataset: int = 6
-    max_components_for_dataset: int = 12
+    num_components: int = 24
+    min_components_for_dataset: int = 24
+    max_components_for_dataset: int = 24
     p_norm: int = 6
     component_shape: str = "superellipsoid"
     box_p_norm: int = 24
@@ -48,8 +48,11 @@ class Config:
 
     # 数据保存参数
     save_every_iter: bool = True
-    save_density: bool = True
+    save_density: bool = False
     save_graph: bool = True
+    save_process_plots: bool = True
+    process_plot_density_threshold: float = 0.5
+    isosurface_resolution: tuple = (240, 24, 80)
     eta_candidates: tuple = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
     feature_schema_version: int = 2
     load_prior_lambda: float = 2.0

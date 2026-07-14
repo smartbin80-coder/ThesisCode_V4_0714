@@ -18,7 +18,14 @@ from utils import ensure_dir, set_random_seed
 
 def writable_dir(path, fallback_name):
     """Return a writable directory, falling back to a temp location if needed."""
-    candidates = [Path(path), Path(__file__).resolve().parent.parent / Path(path).name, Path(tempfile.gettempdir()) / "project_3d_mmc" / fallback_name]
+    requested = Path(path)
+    project_parent = Path(__file__).resolve().parent.parent
+    relative_path = requested if not requested.is_absolute() else Path(requested.name)
+    candidates = [
+        requested,
+        project_parent / relative_path,
+        Path(tempfile.gettempdir()) / "project_3d_mmc" / fallback_name / relative_path.name,
+    ]
     for candidate in candidates:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
@@ -72,7 +79,12 @@ def build_config_for_trajectory(args, trajectory_index):
     cfg.max_iter = int(args.max_iter)
     cfg.save_density = bool(args.save_density)
     cfg.save_graph = True
-    cfg.num_components = int(rng.integers(args.min_components, args.max_components + 1))
+    cfg.save_process_plots = not bool(args.no_process_plots)
+    cfg.process_plot_density_threshold = float(args.process_plot_threshold)
+    if int(args.min_components) == int(args.max_components):
+        cfg.num_components = int(args.min_components)
+    else:
+        cfg.num_components = int(rng.integers(args.min_components, args.max_components + 1))
     cfg.load_y = float(rng.uniform(args.load_y_min * cfg.DW, args.load_y_max * cfg.DW))
     cfg.load_z = float(rng.uniform(args.load_z_min * cfg.DH, args.load_z_max * cfg.DH))
     cfg.max_components_for_dataset = int(args.max_components)
@@ -190,12 +202,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate batched 3D-MMC GNN trajectories.")
     parser.add_argument("--num-trajectories", type=int, default=20)
     parser.add_argument("--seed-start", type=int, default=1000)
-    parser.add_argument("--min-components", type=int, default=6)
-    parser.add_argument("--max-components", type=int, default=12)
-    parser.add_argument("--max-iter", type=int, default=20)
+    parser.add_argument("--min-components", type=int, default=base_config.min_components_for_dataset)
+    parser.add_argument("--max-components", type=int, default=base_config.max_components_for_dataset)
+    parser.add_argument("--max-iter", type=int, default=base_config.max_iter)
     parser.add_argument("--output-dir", type=str, default="dataset")
     parser.add_argument("--results-dir", type=str, default="results/batch")
     parser.add_argument("--save-density", action="store_true")
+    parser.add_argument("--no-process-plots", action="store_true")
+    parser.add_argument("--process-plot-threshold", type=float, default=base_config.process_plot_density_threshold)
     parser.add_argument("--load-y-min", type=float, default=0.25)
     parser.add_argument("--load-y-max", type=float, default=0.75)
     parser.add_argument("--load-z-min", type=float, default=0.25)

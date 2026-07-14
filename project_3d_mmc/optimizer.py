@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import generate_binary_structure, label
 from scipy.optimize import minimize
 
 from fem3d import (
@@ -15,9 +16,10 @@ from fem3d import (
 )
 from graph_export import build_component_graph, build_component_step_labels, build_graph_auxiliary_features, save_graph_npz
 from mma import MMASolver
-from mmc3d_components import components_to_params, get_bounds, params_to_components
+from mmc3d_components import components_to_params, get_bounds, params_to_components, project_params_to_domain
 from tdf import compute_density_with_sensitivities, compute_element_density_from_tdf, compute_global_tdf, compute_global_tdf_with_sensitivities
 from utils import ensure_dir, save_json
+from visualization import plot_topology_isosurface, plot_topology_process
 
 
 def apply_gnn_step_scale(params_old, params_new, eta):
@@ -46,6 +48,7 @@ class MMCOptimizer3D:
 
     def evaluate(self, params):
         """Evaluate compliance, volume fraction, densities, displacement, and graph data."""
+        params = self._project_params(params)
         comps = params_to_components(params, self.components)
         phi = compute_global_tdf(comps, self.nodes, self._tdf_p_norm(), self.config.ks_rho)
         densities = compute_element_density_from_tdf(
@@ -62,11 +65,12 @@ class MMCOptimizer3D:
             compliance=compliance,
             volume_fraction=volume_fraction,
         )
-        return compliance, volume_fraction, densities, U, graph_data, comps
+        connectivity = self._connectivity_metrics(densities)
+        return compliance, volume_fraction, densities, U, graph_data, comps, connectivity
 
     def evaluate_with_sensitivities(self, params):
         """Evaluate response and analytic gradients with respect to MMC design variables."""
-        params = np.asarray(params, dtype=float)
+        params = self._project_params(params)
         if self._cache_params is not None and np.array_equal(params, self._cache_params):
             return self._cache_eval
 
@@ -96,6 +100,7 @@ class MMCOptimizer3D:
             "components": comps,
             "element_strain_energy": element_strain_energy,
             "component_strain_energy_norm": self._component_strain_energy_norm(densities, drho_dparams, element_strain_energy),
+            "connectivity": self._connectivity_metrics(densities),
             "graph_data": build_component_graph(
                 comps,
                 self.config,
@@ -134,7 +139,7 @@ class MMCOptimizer3D:
         compliance_candidates = []
         volume_candidates = []
         for eta in eta_candidates:
-            p_eta = apply_gnn_step_scale(params_old, params_new, eta)
+            p_eta = self._project_params(apply_gnn_step_scale(params_old, params_new, eta))
             c_eta, v_eta, *_ = self.evaluate(p_eta)
             compliance_candidates.append(c_eta)
             volume_candidates.append(v_eta)
@@ -178,7 +183,7 @@ class MMCOptimizer3D:
 
     def callback(self, params):
         """Save iteration history, density field, and graph npz labels."""
-        params = np.asarray(params, dtype=float)
+        params = self._project_params(params)
         eval_data = self.evaluate_with_sensitivities(params)
         compliance = eval_data["compliance"]
         volume_fraction = eval_data["volume_fraction"]
@@ -262,11 +267,25 @@ class MMCOptimizer3D:
                 "trust_predicted_delta": trust_predicted_delta,
                 "trust_bias": trust_bias,
                 "component_strain_energy_norm": eval_data["component_strain_energy_norm"],
+                "connected_to_load": int(eval_data["connectivity"]["connected_to_load"]),
+                "spanning_ratio": float(eval_data["connectivity"]["spanning_ratio"]),
+                "largest_component_ratio": float(eval_data["connectivity"]["largest_component_ratio"]),
                 "trajectory_id": np.asarray(str(getattr(self.config, "trajectory_id", ""))),
                 "seed": int(getattr(self.config, "seed", -1)),
                 "num_components": int(getattr(self.config, "num_components", len(eval_data["components"]))),
                 "load_y": float(getattr(self.config, "load_y", self.config.DW / 2)),
                 "load_z": float(getattr(self.config, "load_z", self.config.DH / 2)),
+                "DL": float(self.config.DL),
+                "DW": float(self.config.DW),
+                "DH": float(self.config.DH),
+                "nelx": int(self.config.nelx),
+                "nely": int(self.config.nely),
+                "nelz": int(self.config.nelz),
+                "E0": float(self.config.E0),
+                "Emin": float(self.config.Emin),
+                "nu": float(self.config.nu),
+                "volfrac": float(self.config.volfrac),
+                "max_iter": int(self.config.max_iter),
             }
             labels.update(auxiliary)
             save_graph_npz(
@@ -282,8 +301,29 @@ class MMCOptimizer3D:
         if self.config.save_density:
             np.save(Path(self.config.results_dir) / f"iter_{self.iteration:04d}_density.npy", densities)
 
+        self._save_process_plot_if_needed(densities, eval_data["components"])
+
         self.prev_params = params.copy()
         self.iteration += 1
+
+    def _save_process_plot_if_needed(self, densities, components):
+        """Save initial/mid/final red 3D topology snapshots for one trajectory."""
+        if not bool(getattr(self.config, "save_process_plots", True)):
+            return
+        max_iter = int(getattr(self.config, "max_iter", 0))
+        mid_iter = max(1, max_iter // 2)
+        stages = {0: "initial", mid_iter: "middle", max_iter: "final"}
+        stage = stages.get(int(self.iteration))
+        if stage is None:
+            return
+        out_dir = Path(self.config.results_dir) / "process_plots"
+        ensure_dir(out_dir)
+        threshold = float(getattr(self.config, "process_plot_density_threshold", 0.5))
+        title = f"{stage.capitalize()} topology | iter {self.iteration:04d}"
+        component_path = out_dir / f"{stage}_components_iter_{self.iteration:04d}.png"
+        isosurface_path = out_dir / f"{stage}_isosurface_iter_{self.iteration:04d}.png"
+        plot_topology_process(densities, self.config, title=title, save_path=component_path, threshold=threshold, components=components)
+        plot_topology_isosurface(components, self.config, title=title, save_path=isosurface_path)
 
     def _save_final(self, result, final_params):
         """Save final arrays and summary."""
@@ -316,13 +356,13 @@ class MMCOptimizer3D:
 
         bounds = np.asarray(get_bounds(self.components, self.config), dtype=float)
         solver = MMASolver(bounds[:, 0], bounds[:, 1], move_limit=0.12)
-        x = np.asarray(x0, dtype=float).copy()
+        x = self._project_params(x0)
         success = True
         message = "MMA converged by max iteration."
         for _ in range(self.config.max_iter):
             data = self.evaluate_with_sensitivities(x)
             g = data["volume_fraction"] - self.config.volfrac
-            raw = solver.update(x, data["compliance"], data["compliance_grad"], g, data["volume_grad"])
+            raw = self._project_params(solver.update(x, data["compliance"], data["compliance_grad"], g, data["volume_grad"]))
             xnew = self._accept_mma_step(x, raw, data)
             change = float(np.max(np.abs(xnew - x)))
             x = xnew
@@ -340,26 +380,51 @@ class MMCOptimizer3D:
         """Use real FEM responses to conservatively accept an MMA step."""
         old_v = current_data["volume_fraction"]
         old_c = current_data["compliance"]
+        old_connectivity = current_data.get("connectivity", {"connected_to_load": False, "spanning_ratio": 0.0})
         old_violation = max(0.0, old_v - self.config.volfrac)
         candidates = []
         eta_list = tuple(float(eta) for eta in self.config.eta_candidates) + (0.0,)
         for eta in sorted(set(eta_list), reverse=True):
-            trial = apply_gnn_step_scale(x, raw, eta)
-            c_trial, v_trial, *_ = self.evaluate(trial)
+            trial = self._project_params(apply_gnn_step_scale(x, raw, eta))
+            c_trial, v_trial, densities_trial, *_ = self.evaluate(trial)
             violation = max(0.0, v_trial - self.config.volfrac)
-            candidates.append((eta, trial, c_trial, v_trial, violation))
+            connectivity = self._connectivity_metrics(densities_trial)
+            candidates.append((eta, trial, c_trial, v_trial, violation, connectivity))
+
+        def connectivity_loss(item):
+            conn = item[5]
+            loss = max(0.0, float(old_connectivity["spanning_ratio"]) - float(conn["spanning_ratio"]))
+            if bool(old_connectivity["connected_to_load"]) and not bool(conn["connected_to_load"]):
+                loss += 1.0
+            return loss
+
+        def nonworse_connectivity(item):
+            conn = item[5]
+            if bool(conn["connected_to_load"]) and not bool(old_connectivity["connected_to_load"]):
+                return True
+            if bool(old_connectivity["connected_to_load"]) and not bool(conn["connected_to_load"]):
+                return False
+            return float(conn["spanning_ratio"]) >= float(old_connectivity["spanning_ratio"]) - 1e-8
+
+        def connected_key(item):
+            conn = item[5]
+            return (-int(bool(conn["connected_to_load"])), -float(conn["spanning_ratio"]), item[2])
 
         feasible = [item for item in candidates if item[4] <= 1e-8]
         if old_violation <= 1e-8 and feasible:
-            eta, trial, *_ = min(feasible, key=lambda item: item[2])
+            nonworse = [item for item in feasible if nonworse_connectivity(item)]
+            eta, trial, *_ = min(nonworse or feasible, key=lambda item: (connectivity_loss(item), *connected_key(item)))
             return trial
 
-        improving_violation = [item for item in candidates if item[4] <= old_violation + 1e-10]
+        positive_candidates = [item for item in candidates if item[0] > 0.0]
+        improving_violation = [item for item in positive_candidates if item[4] <= old_violation + 1e-10]
         if improving_violation:
-            eta, trial, *_ = min(improving_violation, key=lambda item: (item[4], item[2]))
+            nonworse = [item for item in improving_violation if nonworse_connectivity(item)]
+            eta, trial, *_ = min(nonworse or improving_violation, key=lambda item: (item[4], connectivity_loss(item), *connected_key(item)))
             return trial
 
-        return x.copy()
+        _, trial, *_ = min(positive_candidates or candidates, key=lambda item: (connectivity_loss(item), item[4], *connected_key(item)))
+        return trial
 
     def _run_slsqp(self, x0):
         """Run SLSQP using the same analytic gradients."""
@@ -376,7 +441,7 @@ class MMCOptimizer3D:
 
     def run(self):
         """Execute optimization and save final results."""
-        x0 = components_to_params(self.components)
+        x0 = self._project_params(components_to_params(self.components))
         self.prev_params = None
         self.callback(x0)
         if self.config.optimizer_type.upper() == "MMA":
@@ -385,9 +450,51 @@ class MMCOptimizer3D:
             result = self._run_slsqp(x0)
         else:
             raise ValueError(f"Unsupported optimizer_type: {self.config.optimizer_type}")
-        final_params = result.x
+        final_params = self._project_params(result.x)
         final_eval = self._save_final(result, final_params)
         return result, final_eval
+
+    def _project_params(self, params):
+        """Project flattened MMC parameters to the strict design-domain constraint."""
+        projected = project_params_to_domain(params, self.components, self.config)
+        return np.asarray(projected, dtype=float)
+
+    def _connectivity_metrics(self, densities):
+        """Measure whether the thresholded density connects the fixed side to the load side."""
+        vals = np.asarray(densities, dtype=float).reshape(self.config.nelx, self.config.nely, self.config.nelz)
+        threshold = float(getattr(self.config, "process_plot_density_threshold", 0.5))
+        solid = vals >= threshold
+        if not np.any(solid):
+            return {"connected_to_load": False, "spanning_ratio": 0.0, "largest_component_ratio": 0.0}
+
+        labels, count = label(solid, structure=generate_binary_structure(3, 1))
+        if count == 0:
+            return {"connected_to_load": False, "spanning_ratio": 0.0, "largest_component_ratio": 0.0}
+
+        solid_count = float(np.sum(solid))
+        component_sizes = np.bincount(labels.ravel(), minlength=count + 1).astype(float)
+        largest_component_ratio = float(np.max(component_sizes[1:]) / solid_count)
+        left_labels = set(int(v) for v in np.unique(labels[0, :, :]) if v > 0)
+        j = int(np.clip(round((float(getattr(self.config, "load_y", self.config.DW / 2)) / self.config.DW) * (self.config.nely - 1)), 0, self.config.nely - 1))
+        k = int(np.clip(round((float(getattr(self.config, "load_z", self.config.DH / 2)) / self.config.DH) * (self.config.nelz - 1)), 0, self.config.nelz - 1))
+        j0, j1 = max(0, j - 1), min(self.config.nely, j + 2)
+        k0, k1 = max(0, k - 1), min(self.config.nelz, k + 2)
+        load_labels = set(int(v) for v in np.unique(labels[-1, j0:j1, k0:k1]) if v > 0)
+        connected_labels = left_labels & load_labels
+        if connected_labels:
+            connected_mass = max(component_sizes[label_id] for label_id in connected_labels)
+            return {
+                "connected_to_load": True,
+                "spanning_ratio": float(connected_mass / solid_count),
+                "largest_component_ratio": largest_component_ratio,
+            }
+        endpoint_labels = left_labels | load_labels
+        endpoint_mass = max((component_sizes[label_id] for label_id in endpoint_labels), default=0.0)
+        return {
+            "connected_to_load": False,
+            "spanning_ratio": float(endpoint_mass / solid_count),
+            "largest_component_ratio": largest_component_ratio,
+        }
 
     def _tdf_p_norm(self):
         """Return the TDF p-norm for the configured component shape."""

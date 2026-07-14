@@ -124,6 +124,12 @@ class MMCStepDataset(Dataset):
                 data.trajectory_id = str(npz["trajectory_id"])
             else:
                 data.trajectory_id = _trajectory_id_from_file(self.files[idx])
+            for key in ("DL", "DW", "DH", "E0", "Emin", "nu", "volfrac"):
+                if key in npz:
+                    data[key] = _npz_scalar_tensor(npz, key)
+            for key in ("nelx", "nely", "nelz", "max_iter"):
+                if key in npz:
+                    data[key] = torch.as_tensor([int(npz[key])], dtype=torch.long)
         return data
 
 

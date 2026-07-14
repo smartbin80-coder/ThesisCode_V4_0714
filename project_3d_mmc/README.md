@@ -1,179 +1,153 @@
-# 3D-MMC 拓扑优化与 GNN 数据集生成
+# 3D-MMC Cantilever Topology Optimization with GNN Step Prediction
 
-这是一个可运行、模块化的 3D Moving Morphable Component 项目，用于三维悬臂梁最小柔度拓扑优化，以及后续 GNN 数据集构建。
+本项目用于三维悬臂梁的 Moving Morphable Component (MMC) 拓扑优化，并为后续图神经网络训练导出逐迭代图数据。当前技术路线不是用神经网络替代有限元或灵敏度分析，而是在传统 MMA 优化方向给定后，用 GNN 学习候选步长和组件级步长缩放，使 AI 只影响“走多远”，不改变“往哪里走”。
 
-## 依赖安装
+## 当前默认算例
+
+默认设计域和离散网格：
+
+```python
+DL = 60.0
+DW = 4.0
+DH = 20.0
+nelx = 60
+nely = 4
+nelz = 20
+```
+
+默认 MMC 和优化参数：
+
+```python
+num_components = 24
+min_components_for_dataset = 24
+max_components_for_dataset = 24
+volfrac = 0.4
+max_iter = 20
+eta_candidates = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+save_density = False
+save_process_plots = True
+```
+
+边界条件为悬臂梁工况：左端面 `x = 0` 全固定，右端面 `x = DL` 附近施加 `-Z` 方向集中力。默认载荷点位于右端面中心，即：
+
+```python
+load_point = [60.0, 2.0, 10.0]
+```
+
+批量生成数据时，`load_y` 和 `load_z` 会在设计域中随机扰动。
+
+## 安装依赖
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-依赖包括 `numpy`、`scipy`、`matplotlib`。当前版本不再使用无 SciPy 的替代优化路径。
+主要依赖包括：
+
+- `numpy`
+- `scipy`
+- `matplotlib`
+- `torch`
+- `torch-geometric`
+- `scikit-image`
+
+其中 `scikit-image` 用于从 MMC 全局隐式函数中提取 `phi = 0` 等值面。
+
+## 快速运行
+
+单条默认优化：
+
+```bash
+cd project_3d_mmc
+python -B main.py
+```
+
+生成一条 50 步随机轨迹：
+
+```bash
+python -B generate_dataset.py --num-trajectories 1 --max-iter 50 --output-dir D:\codex\workspace_code_v2\dataset_domain60_random_1x50 --results-dir D:\codex\workspace_code_v2\results_domain60_random_1x50
+```
+
+生成 5 条 50 步轨迹：
+
+```bash
+python -B generate_dataset.py --num-trajectories 5 --max-iter 50 --output-dir D:\codex\workspace_code_v2\dataset_domain60_5x50 --results-dir D:\codex\workspace_code_v2\results_domain60_5x50
+```
 
 ## 方法概述
 
-项目用多个三维 MMC 构件显式描述结构。每个构件包含 9 个设计变量：
+每个 MMC 组件由 9 个设计变量描述：
 
 ```text
 x0, y0, z0, L1, L2, L3, alpha, beta, gamma
 ```
 
-构件 TDF 默认通过超椭球形式定义。也可以在 `config.py` 中设置 `component_shape = "box"`，此时使用高阶 p-norm 作为长方体/盒状构件的平滑近似，仍保留可导灵敏度。多构件 TDF 使用 KS 函数近似 `max` 聚合，再经平滑 Heaviside 映射为有限元单元密度。有限元模块使用规则 Hex8 单元，左端面固定，右端面中心施加向下集中力，目标函数为柔度 `F^T U`，约束为 `volume_fraction <= volfrac`。
-
-优化默认使用 MMA。代码实现了柔度和体积分数对 MMC 参数的解析灵敏度，链式路径为：
+组件默认采用超椭球 TDF，多个组件通过 KS 聚合近似并集，再经平滑 Heaviside 映射为有限元单元密度。有限元模块使用规则 Hex8 单元，目标函数为柔度：
 
 ```text
-compliance -> element density -> Heaviside(TDF) -> KS aggregation -> MMC parameters
+compliance = F^T U
 ```
 
-SLSQP 仍保留为可选优化器，并使用同一套解析梯度。
-
-默认 `stop_on_convergence = False`，MMA 会执行完整 `max_iter`，便于生成固定长度的 GNN 迭代数据。若只关心优化收敛速度，可改为 `True`。
-
-## 如何运行
-
-```bash
-cd project_3d_mmc
-python main.py
-```
-
-输出：
-
-- `dataset/iter_XXXX_graph.npz`: 每次迭代的 GNN 图数据。
-- `results/*.npy`: 密度场和最终参数。
-- `results/*.png`: 构件、密度切片和历史曲线。
-- `results/summary.json`: 最终状态摘要。
-
-程序优先写入项目内 `dataset/` 和 `results/`。如果当前沙箱或权限策略拒绝写入，入口程序会自动回退到可写临时目录，并在运行结束时打印实际输出路径。
-
-## 修改规模
-
-默认配置在 `config.py` 中：
-
-```python
-nelx = 20
-nely = 6
-nelz = 6
-num_components = 8
-max_iter = 20
-```
-
-构件形状可在同一文件中修改：
-
-```python
-component_shape = "superellipsoid"  # 默认
-component_shape = "box"             # 高阶 p-norm 平滑盒状近似
-```
-
-更精细的实验可以改为：
-
-```python
-nelx = 40
-nely = 12
-nelz = 12
-num_components = 16
-max_iter = 100
-```
-
-三维有限元计算成本增长很快，建议先用小网格验证流程，再增加网格和构件数量。
-
-## 如何导出 GNN 数据
-
-默认 `save_graph=True`，每次优化迭代都会保存一个 `npz` 文件。图构建规则是：每个 MMC 构件为一个节点，构件距离接近或包围球近似重叠时建立双向边。
-
-`node_features` 是训练用归一化特征，`node_features_raw` 保留原始物理量便于检查。
-
-训练节点特征包含：
+约束为：
 
 ```text
-x0/DL, y0/DW, z0/DH,
-L1/max(DL,DW,DH), L2/max(DL,DW,DH), L3/max(DL,DW,DH),
-sin/cos(alpha, beta, gamma),
-component_volume/domain_volume,
-active_flag,
-compliance_grad_norm,
-volume_grad_norm,
-delta_params_norm,
-delta_center_norm,
-delta_size_norm,
-delta_angle_norm
+volume_fraction <= volfrac
 ```
 
-边特征：
+优化器默认使用 MMA。代码保留解析灵敏度链路：
 
 ```text
-normalized_distance,
-normalized_dx, normalized_dy, normalized_dz,
-alignment_trace,
-axis1_dot, axis2_dot, axis3_dot,
-overlap_flag,
-contact_score
+compliance -> density -> Heaviside(TDF) -> KS aggregation -> MMC parameters
 ```
 
-每个图还保存 `global_features`：
+## 几何可行域约束
 
-```text
-iteration/max_iter,
-compliance,
-volume_fraction,
-volfrac,
-load_y/DW,
-load_z/DH,
-num_components/max_components_for_dataset
-```
-
-## 批量生成 GNN 轨迹数据集
-
-单次 `main.py` 只生成一条优化轨迹。用于训练 GNN 时，建议使用批量脚本生成多条随机轨迹：
-
-```bash
-python generate_dataset.py --num-trajectories 200 --max-iter 20 --min-components 6 --max-components 12 --output-dir dataset --results-dir results/batch
-```
-
-脚本会随机化：
-
-- `seed`
-- `num_components`
-- 初始 MMC 构件中心、尺寸、角度
-- 右端面载荷位置 `load_y, load_z`
-
-图文件命名格式：
-
-```text
-traj_0007_iter_0012_graph.npz
-```
-
-同时生成：
-
-```text
-dataset/dataset_index.csv
-```
-
-其中记录每条 trajectory 的 seed、构件数量、载荷位置、最终柔度和最终体积分数。
-
-## 如何使用本项目生成 GNN 步长预测数据集
-
-本项目在 `optimizer.py` 中提供了 GNN 步长缩放接口：
+当前代码对每个旋转后的 MMC 组件做严格设计域投影。投影逻辑基于旋转后 AABB 半宽：
 
 ```python
-apply_gnn_step_scale(params_old, params_new, eta)
+half_extent = abs(R) @ [L1, L2, L3]
 ```
 
-传统更新方向仍由 MMA 或 SLSQP 给出。每次迭代得到 `params_new` 后，程序计算：
+并保证：
+
+```text
+center - half_extent >= [0, 0, 0]
+center + half_extent <= [DL, DW, DH]
+```
+
+这避免了组件中心仍在域内、但旋转后实体越出 `60 x 4 x 20` 可行域的问题。
+
+## 初始化策略
+
+当前批量数据生成使用 24 个随机分散、严格域内可行的 MMC 组件。近期 1 条 50 步随机分散实验表明，完全随机撒点通常不能形成从固定端到载荷端的连续传力路径，最终等值面仍呈分散块状。因此，正式训练数据建议采用“悬臂梁专用随机初始化”：保留随机性，但需要保证固定端、载荷端和中间桥接区域有基本覆盖。
+
+## 过程图与论文式等值面
+
+每条轨迹会在开始、中间和结束三个节点保存过程图：
+
+```text
+initial_components_iter_0000.png
+initial_isosurface_iter_0000.png
+middle_components_iter_XXXX.png
+middle_isosurface_iter_XXXX.png
+final_components_iter_XXXX.png
+final_isosurface_iter_XXXX.png
+```
+
+两类图含义不同：
+
+- `*_components_*`：逐组件调试图，直接显示每个 MMC 组件表面。
+- `*_isosurface_*`：论文式拓扑图，从 KS 聚合后的全局隐式边界 `phi = 0` 提取等值面。
+
+默认等值面采样分辨率：
 
 ```python
-params_eta = params_old + eta * (params_new - params_old)
+isosurface_resolution = (240, 24, 80)
 ```
 
-默认候选步长为：
+## GNN 数据导出
 
-```python
-eta_candidates = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
-```
-
-程序会分别评估每个候选步长的 `compliance_eta` 和 `volume_fraction_eta`，再选择满足体积约束且柔度最低的 `eta` 作为 `eta_label`。若所有候选都违反体积约束，则 `eta_label = 0.0` 并设置失败标记。
-
-每个 `dataset/iter_XXXX_graph.npz` 包含：
+每次迭代会导出一个 `*_graph.npz` 图样本。节点对应 MMC 组件，边由几何接近、包围球重叠和接触评分建立。核心字段包括：
 
 ```text
 node_features
@@ -181,9 +155,6 @@ node_features_raw
 edge_index
 edge_attr
 global_features
-compliance
-volume_fraction
-iteration
 params
 delta_params
 eta_candidates
@@ -194,86 +165,68 @@ eta_failure_flag
 compliance_candidates
 volume_candidates
 response_targets
-trajectory_id
-seed
-num_components
-load_y
-load_z
-feature_schema_version
-load_point
-node_load_distance_norm
-node_load_prior
-edge_load_prior
-eta_node_label
-eta_node_label_index
-trust_actual_delta
-trust_predicted_delta
-trust_bias
-component_strain_energy_norm
+connected_to_load
+spanning_ratio
+largest_component_ratio
 ```
 
-后续训练 GNN 时可使用：
-
-- 输入：当前 MMC 构件图，即 `node_features`, `edge_index`, `edge_attr`, `edge_load_prior`
-- 全局输入：`global_features`
-- 主输出：组件级连续步长 `eta_node_label`
-- 图级辅助输出：连续最优步长 `eta_label`
-- 辅助输出：`eta_label_index`, `eta_failure_flag`, `response_targets`
-- 分类辅助损失只在 `eta_failure_flag = 0` 的样本上计算；候选全部失败时不把 `eta_label_index = -1` 强行映射到 0 类。
-
-如果所有候选步长都违反体积约束：
-
-- `eta_label = 0.0`
-- `eta_label_index = -1`
-- `eta_failure_flag = 1`
-
-项目提供 PyTorch Geometric 数据加载器：
+`eta_label` 来自真实 FEM 候选步长评估。程序会分别评估 6 个候选步长：
 
 ```python
-from pyg_dataset import MMCStepDataset, create_dataloader
+[0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
+```
 
-dataset = MMCStepDataset("dataset")
-loader = create_dataloader("dataset", batch_size=8)
+若存在满足体积分数约束的候选，则选择柔度最低者作为标签；若都不可行，则记录失败标志，避免把失败样本错误映射到某个分类标签。
+
+## 训练入口
+
+按轨迹划分训练、验证、测试集：
+
+```bash
+python -B split_by_trajectory.py --index dataset/dataset_index.csv --output-dir dataset/splits
 ```
 
 训练物理偏置 GAT：
 
 ```bash
-python train_gnn_step.py --dataset-dir dataset --epochs 50 --batch-size 8
+python -B train_gnn_step.py --dataset-dir dataset --split-file dataset/splits/train_trajectories.txt --val-split-file dataset/splits/val_trajectories.txt --epochs 50 --batch-size 8
 ```
 
-物理先验注意力使用非负约束：实际缩放为 `actual_alpha = 0.1 + 0.9 * sigmoid(raw_alpha)`，始终位于 `[0.1, 1.0]`。`raw_alpha` 默认前 20 个 epoch 冻结，使 `actual_alpha` 贴近 `0.1`；之后释放训练，并使用单独的 `alpha_weight_decay = 1e-4`。可通过 `--alpha-freeze-epochs` 和 `--alpha-weight-decay` 覆盖。
-
-MAML 风格元学习预训练：
+运行 MAML 风格元学习：
 
 ```bash
-python meta_learning.py --dataset-dir dataset --epochs 20
+python -B meta_learning.py --dataset-dir dataset --epochs 20
 ```
 
-按轨迹划分训练/验证/测试集，避免同一条轨迹的相邻迭代步泄漏到不同集合：
+在线单步测试：
 
 ```bash
-python split_by_trajectory.py --index dataset/dataset_index.csv --output-dir dataset/splits
+python -B test_online_step.py --dataset-dir dataset --results-dir results/online_step
 ```
 
-加载指定 split：
+`test_online_step.py` 默认优先加载 `results_debug/gat_maml_model.pt`，若不存在则回退到 `results_debug/gat_step_model.pt`。
 
-```python
-train_set = MMCStepDataset("dataset", split_file="dataset/splits/train_trajectories.txt")
-val_set = MMCStepDataset("dataset", split_file="dataset/splits/val_trajectories.txt")
-test_set = MMCStepDataset("dataset", split_file="dataset/splits/test_trajectories.txt")
-```
+## 当前已验证内容
+
+- 6 个 eta 候选步长链路已打通。
+- `test_online_step.py` 可从项目目录或仓库根目录运行。
+- GAT checkpoint 与 MAML checkpoint 路径回退逻辑已实现。
+- 旋转后 MMC 组件严格限制在 `60 x 4 x 20` 设计域内。
+- 隐式等值面绘图可输出论文式红色拓扑表面。
+- 连接性诊断字段 `connected_to_load`, `spanning_ratio`, `largest_component_ratio` 已写入图样本。
 
 ## 当前限制
 
-- MMA 实现面向本项目的单体积约束问题，不是通用多约束工业 MMA 包。
-- 解析灵敏度覆盖柔度、体积分数、TDF、KS、Heaviside 和 MMC 参数，但尚未加入二阶信息。
-- `component_shape = "box"` 使用高阶 p-norm 平滑近似，不是不可导的精确布尔长方体边界。
-- 高分辨率 3D 问题计算量较大。
-- 图边规则是几何近似，后续可加入载荷路径识别和更丰富的物理特征。
+- 组件级标签目前仍主要来自图级 eta 标签广播，尚未实现真正逐组件差异化标签。
+- 完全随机分散初始化不能可靠形成悬臂梁连续传力路径，正式训练前需要改为悬臂梁专用随机初始化。
+- 当前 MAML 为 first-order 风格实现，不是完整二阶 MAML。
+- GAT 尚未完全嵌入 MMC 主优化闭环做长期在线验证。
+- 高分辨率 3D FEM 计算成本较高，建议逐步扩大轨迹数量和迭代步数。
 
-## 后续扩展
+## 建议下一步
 
-- 加入更多图标签，如下一步真实柔度、约束违反程度、灵敏度统计量。
-- 用训练好的 GAT 预测组件级 `eta_node_label`，再通过组件级步长缩放调整传统优化器给出的更新步长。
-- 在线阶段使用 `online_meta_controller.py` 中的 trust-bias 触发、稀疏真标签微调和安全回退阻尼。
+1. 设计悬臂梁专用随机初始化，确保初始结构至少存在固定端到载荷端的可行连通路径。
+2. 用 `20-50` 条短轨迹验证初始化稳定性、连通性和体积约束。
+3. 生成 `100-500` 条正式训练轨迹，并按轨迹划分训练/验证/测试集。
+4. 训练 GAT 与 MAML 模型，比较普通监督训练、元学习预训练和在线微调效果。
+5. 将 GAT 步长预测接入主优化闭环，进行真实收敛速度、柔度和稳定性对比。

@@ -15,6 +15,10 @@ from pyg_dataset import MMCStepDataset
 from train_gnn_step import build_optimizer, compute_step_losses, set_alpha_trainable
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = PROJECT_DIR.parent
+
+
 def group_indices_by_trajectory(dataset):
     """Group dataset indices by trajectory id for task construction."""
     groups = defaultdict(list)
@@ -136,7 +140,7 @@ def parse_args():
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--response-candidates", type=int, default=6)
-    parser.add_argument("--checkpoint", type=str, default="gat_maml_model.pt")
+    parser.add_argument("--checkpoint", type=str, default=str(WORKSPACE_DIR / "results_debug" / "gat_maml_model.pt"))
     return parser.parse_args()
 
 
@@ -157,6 +161,7 @@ def main():
         response_candidates=args.response_candidates,
     ).to(device)
     optimizer = build_optimizer(model, args.meta_lr, args.alpha_weight_decay)
+    Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         alpha_trainable = epoch > args.alpha_freeze_epochs
         set_alpha_trainable(model, alpha_trainable)

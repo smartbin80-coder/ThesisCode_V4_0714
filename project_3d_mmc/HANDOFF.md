@@ -80,6 +80,24 @@ trust_bias_threshold = 0.10
 node_step_label_mode = "global_broadcast"
 ```
 
+2026-07-14 默认配置已经切换到 60×4×20 设计域和固定 24 组件：
+
+```python
+DL = 60.0
+DW = 4.0
+DH = 20.0
+nelx = 60
+nely = 4
+nelz = 20
+max_iter = 20
+num_components = 24
+min_components_for_dataset = 24
+max_components_for_dataset = 24
+save_density = False
+save_process_plots = True
+eta_candidates = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+```
+
 候选步长标签规则：
 
 1. 对每个候选 `eta` 计算真实 FEM 响应 `compliance_eta` 和 `volume_fraction_eta`。
@@ -143,6 +161,17 @@ seed
 num_components
 load_y
 load_z
+DL
+DW
+DH
+nelx
+nely
+nelz
+E0
+Emin
+nu
+volfrac
+max_iter
 ```
 
 schema v2 新增字段：
@@ -170,6 +199,7 @@ component_strain_energy_norm
 - `eta_node_label` 当前第一版由图级 `eta_label` 广播得到。
 - `component_strain_energy_norm` 用单元应变能和密度灵敏度软聚合到组件级。
 - `trust_bias` 用于在线微调触发。
+- `DL/DW/DH`, `nelx/nely/nelz`, `E0/Emin/nu`, `volfrac`, `max_iter` 是在线单步 FEM evaluator 重建元数据；旧数据缺失时 `test_online_step.py` 回退到当前 `config.py`。
 
 重要：旧数据没有这些字段，但 loader 会补齐默认张量。
 
@@ -309,6 +339,140 @@ SafetyDampingController
 10. MAML smoke 1 epoch 跑通。
 11. 在线控制器 smoke test 跑通，安全回退后阻尼序列为 `0.8, 0.8, 0.8, 1.0`。
 
+### 2026-07-14 笔记本 5 轨迹全链路验证（6 候选）
+
+按桌面作业指导书完成了轻量链路调试。由于当前 Python 进程在 `project_3d_mmc` 子目录下创建新目录时会遇到权限限制，`generate_dataset.py` 的 `writable_dir` 自动把调试数据和结果落到仓库根目录：
+
+```text
+D:\codex\workspace_code_v2\dataset_debug
+D:\codex\workspace_code_v2\results_debug
+```
+
+已执行并通过：
+
+```powershell
+python -B generate_dataset.py --num-trajectories 5 --max-iter 10 --min-components 4 --max-components 8 --output-dir dataset_debug --results-dir results_debug/batch
+python -B split_by_trajectory.py --index D:\codex\workspace_code_v2\dataset_debug\dataset_index.csv --output-dir D:\codex\workspace_code_v2\dataset_debug\splits --train-ratio 0.6 --val-ratio 0.2
+python -B train_gnn_step.py --dataset-dir D:\codex\workspace_code_v2\dataset_debug --split-file D:\codex\workspace_code_v2\dataset_debug\splits\train_trajectories.txt --val-split-file D:\codex\workspace_code_v2\dataset_debug\splits\val_trajectories.txt --epochs 5 --batch-size 4 --hidden-channels 16 --heads 2
+python -B meta_learning.py --dataset-dir D:\codex\workspace_code_v2\dataset_debug --epochs 3 --tasks-per-epoch 2 --support-size 2 --query-size 2 --inner-steps 1 --meta-lr 1e-4 --hidden-channels 16 --heads 2
+python -B test_online_step.py
+python -B project_3d_mmc\test_online_step.py
+```
+
+验收结果：
+
+- 数据生成成功：5 条轨迹，每条包含 `iter_0000` 到 `iter_0010`，共 55 个 `*_graph.npz`。
+- 首个样本包含 `edge_load_prior`，shape 为 `(20, 1)`；`eta_candidates.shape == (6,)`，`response_targets.shape == (6, 2)`。
+- 轨迹切分成功：train=3，val=1，test=1。
+- GAT 训练 5 epoch 跑通，无 NaN；最后一轮 `train_loss=1.986164e+00`，`val_loss=2.829171e+00`，并保存 `D:\codex\workspace_code_v2\results_debug\gat_step_model.pt`。
+- MAML 训练 3 epoch 跑通并保存 `D:\codex\workspace_code_v2\results_debug\gat_maml_model.pt`；最后一轮 `meta_loss=1.074905e+01`。
+- 新增 `test_online_step.py` 单步在线模拟脚本，已输出组件级 eta 和 FEM 试探结果：
+  - 从 `project_3d_mmc` 子目录和仓库根目录运行均通过。
+  - 默认加载 MAML checkpoint，预测的组件步长：`[0.8238, 0.7945, 0.8417, 0.8389, 0.8173]`
+  - 显式加载 GAT checkpoint 通过，预测的组件步长：`[0.6482, 0.6391, 0.6226, 0.6727, 0.6461]`
+  - 试探后的柔度值：`7.942713e+04`
+  - 试探后的体积分数：`1.300854e-01`
+  - checkpoint 回退逻辑已定向验证：当 MAML checkpoint 缺失时会回退到 `gat_step_model.pt`。
+
+结论：全链路（数据生成 -> 加载 -> 训练 -> MAML -> 在线单步模拟）已打通，可进行 5 轨迹验证级别的后续实验。
+
+### 2026-07-14 代码审阅后修复
+
+本轮自审后修复了 3 个问题：
+
+- `_accept_mma_step` 的兜底逻辑不再被 `eta=0.0` 吞掉；约束违反未改善时，会在正候选步长中选择 `(violation, compliance)` 最小者，避免继续原地停滞。
+- `generate_dataset.writable_dir()` 的回退路径保留相对层级，例如 `results_debug/batch` 不再退化成仓库根目录 `batch`。
+- 图样本新增 FEM evaluator 重建元数据，`test_online_step.py` 优先读取样本元数据，并支持 `--nelx --nely --nelz --Emin` 显式覆盖；旧数据缺字段时回退到当前 `config.py`。
+
+已验证：
+
+```powershell
+python -B -c "import ast, pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ['generate_dataset.py','optimizer.py','pyg_dataset.py','test_online_step.py']]; print('syntax ok')"
+python -B project_3d_mmc\test_online_step.py
+python -B generate_dataset.py --num-trajectories 1 --max-iter 1 --min-components 4 --max-components 4 --output-dir D:\codex\workspace_code_v2\dataset_metadata_smoke --results-dir D:\codex\workspace_code_v2\results_metadata_smoke
+python -B test_online_step.py --dataset-dir D:\codex\workspace_code_v2\dataset_metadata_smoke --results-dir D:\codex\workspace_code_v2\results_metadata_smoke\online_step
+```
+
+metadata smoke 首个样本已确认包含 `DL/DW/DH`, `nelx/nely/nelz`, `E0/Emin/nu`, `volfrac`, `max_iter`。
+
+### 2026-07-14 MMC 过程拓扑图功能
+
+新增每条轨迹自动输出三张红色 3D 拓扑过程图：
+
+```text
+results_dir/process_plots/initial_iter_0000.png
+results_dir/process_plots/middle_iter_XXXX.png
+results_dir/process_plots/final_iter_XXXX.png
+```
+
+实现位置：
+
+- `visualization.py`: `plot_topology_process(...)`，红色体素实体、白底、固定视角。
+- `optimizer.py`: `callback()` 后调用 `_save_process_plot_if_needed(...)`，在 `iteration == 0`, `max(1, max_iter // 2)`, `max_iter` 保存三张图。
+- `generate_dataset.py`: 新增 `--no-process-plots` 和 `--process-plot-threshold`。
+
+已验证：
+
+```powershell
+python -B generate_dataset.py --num-trajectories 1 --max-iter 2 --min-components 4 --max-components 4 --output-dir D:\codex\workspace_code_v2\dataset_plot_smoke --results-dir D:\codex\workspace_code_v2\results_plot_smoke
+```
+
+输出确认：
+
+```text
+D:\codex\workspace_code_v2\results_plot_smoke\traj_0000\process_plots\initial_iter_0000.png
+D:\codex\workspace_code_v2\results_plot_smoke\traj_0000\process_plots\middle_iter_0001.png
+D:\codex\workspace_code_v2\results_plot_smoke\traj_0000\process_plots\final_iter_0002.png
+```
+
+当前低网格 smoke 图会偏块状；扩大到 `20x8x8` 或更高网格后会更接近参考图的连续结构外观。
+
+### 2026-07-14 默认设计域扩大到 60×4×20
+
+默认设计域和组件数已从小型调试算例改为：
+
+```python
+DL = 60.0
+DW = 4.0
+DH = 20.0
+nelx = 60
+nely = 4
+nelz = 20
+num_components = 24
+min_components_for_dataset = 24
+max_components_for_dataset = 24
+max_iter = 20
+```
+
+`create_initial_components(config)` 的单次默认初始构件改为 `6 × 2 × 2 = 24` 规则阵列：
+
+- x 从 `0.15*DL` 到 `0.90*DL` 共 6 组。
+- y 为 `0.30*DW` 和 `0.70*DW`。
+- z 为 `0.30*DH` 和 `0.70*DH`。
+- 初始半轴为 `L1=DL/14`, `L2=DW/5`, `L3=DH/8`。
+
+批量数据生成默认固定 24 组件：`min_components_for_dataset=max_components_for_dataset=24`。若显式传入不同 `--min-components/--max-components`，仍可恢复随机组件数量。
+
+已执行最小 smoke：
+
+```powershell
+python -B generate_dataset.py --num-trajectories 1 --max-iter 2 --output-dir D:\codex\workspace_code_v2\dataset_domain60_smoke --results-dir D:\codex\workspace_code_v2\results_domain60_smoke
+```
+
+验收结果：
+
+- `num_components=24`。
+- `DL=60.0`, `DW=4.0`, `DH=20.0`。
+- `nelx=60`, `nely=4`, `nelz=20`，单元数 `4800`。
+- 首个样本 `load_point=[60.0, 2.0427714759501256, 11.038418470063295]`。
+- `eta_candidates.shape == (6,)`，`response_targets.shape == (6, 2)`。
+- 三张过程图生成成功，尺寸均为 `1980×1144`：
+  - `initial_iter_0000.png`
+  - `middle_iter_0001.png`
+  - `final_iter_0002.png`
+
+注意：该 smoke 约耗时 60-90 秒。后续扩大到 `5` 条轨迹、`10` 步前，建议先确认机器资源可接受；`20` 条轨迹、`20` 步会显著更慢。
+
 ## 12. 当前未完成和风险
 
 当前尚未完成：
@@ -374,3 +538,52 @@ SafetyDampingController
 7. `eta_label_index = -1` 是失败标记，不要在分类损失里强行 clamp 成 0 类。
 8. GAT 只允许预测步长缩放，不允许替代 FEM 或灵敏度方向。
 9. 所有在线预测步长必须经 FEM 验证，不可靠时必须回退到保守候选搜索。
+
+## 2026-07-14 Strict MMC Domain Feasibility Fix
+
+Issue confirmed from `dataset_domain60_5x50`: component centers stayed inside `60 x 4 x 20`, but rotated component AABBs exceeded the design domain, especially in the narrow `Y` direction. This was a real geometry issue, not a plotting artifact.
+
+Implemented fix:
+- `mmc3d_components.py` now provides rotated-AABB helpers: `component_half_extent`, `component_domain_margins`, `components_are_in_domain`, `project_component_to_domain`, and `project_params_to_domain`.
+- `create_random_components(config, rng)` now samples strictly feasible randomized components by sampling size/orientation first, then sampling centers from the feasible AABB range.
+- `create_initial_components(config)` now also passes through strict domain projection.
+- `optimizer.py` projects parameters before FEM evaluation, eta-candidate evaluation, MMA candidate acceptance, callback export, and final saving.
+- Existing `dataset_domain60_5x50` should be treated as diagnostic/invalid for final training because it contains out-of-domain component geometry.
+
+Validation completed:
+```powershell
+python -B generate_dataset.py --num-trajectories 1 --max-iter 5 --output-dir D:\codex\workspace_code_v2\dataset_domain60_feasible_smoke_1x5 --results-dir D:\codex\workspace_code_v2\results_domain60_feasible_smoke_1x5
+python -B generate_dataset.py --num-trajectories 1 --max-iter 50 --output-dir D:\codex\workspace_code_v2\dataset_domain60_feasible_1x50 --results-dir D:\codex\workspace_code_v2\results_domain60_feasible_1x50
+```
+
+Final `1 x 50` verification:
+- Graph samples: `51` (`traj_0000_iter_0000_graph.npz` through `traj_0000_iter_0050_graph.npz`).
+- Metadata: `DL=60.0`, `DW=4.0`, `DH=20.0`, `num_components=24`, `eta_candidates.shape=(6,)`.
+- Process plots generated under `results_domain60_feasible_1x50\traj_0000\process_plots`: `initial_iter_0000.png`, `middle_iter_0025.png`, `final_iter_0050.png`.
+- Rotated-AABB domain check over all 51 graph files: `bad_count=0`, `min_margin=0.0`.
+
+Note: strict projection keeps geometry valid but can make the optimizer stall when several candidate steps project to the same boundary-feasible state. The verified `1 x 50` run plateaued after roughly iteration 31. Future work should consider smoother geometry constraints or narrower move limits for scale/orientation variables.
+
+## 2026-07-14 Connected MMC Isosurface Validation
+
+Implemented paper-style connected MMC topology visualization and connectivity guarding:
+- Installed and recorded `scikit-image` for `skimage.measure.marching_cubes`.
+- `visualization.py` now renders `phi=0` isosurfaces from the KS-aggregated global MMC TDF.
+- Process plots now save both component-debug images and isosurface topology images.
+- `mmc3d_components.py` now supports strictly feasible 24-component initialization for the cantilever setting. The latest experimental default for batched data generation is randomized scattered components; the 1 x 50 random-scattered test showed poor load-path connectivity, so the next production initializer should be cantilever-biased rather than copied from another beam benchmark or fully random.
+- `optimizer.py` computes density connectivity with 6-neighbor connected components and includes `connected_to_load`, `spanning_ratio`, and `largest_component_ratio` in graph labels.
+- MMA candidate acceptance now prefers volume-feasible candidates that do not worsen connectivity.
+
+Validation commands completed:
+```powershell
+python -B generate_dataset.py --num-trajectories 1 --max-iter 5 --output-dir D:\codex\workspace_code_v2\dataset_domain60_connected_smoke_1x5 --results-dir D:\codex\workspace_code_v2\results_domain60_connected_smoke_1x5
+python -B generate_dataset.py --num-trajectories 1 --max-iter 50 --output-dir D:\codex\workspace_code_v2\dataset_domain60_connected_1x50 --results-dir D:\codex\workspace_code_v2\results_domain60_connected_1x50
+```
+
+Final `1 x 50` result:
+- Graph samples: `51`.
+- Metadata: `DL=60.0`, `DW=4.0`, `DH=20.0`, `num_components=24`, `eta_candidates.shape=(6,)`.
+- Connectivity over all graph files: `bad_connected=[]`, `min_spanning=1.0`.
+- Compliance improved from `114.65327441733338` to `103.88421390338605`.
+- Volume fraction changed from `0.39235007472465117` to `0.3818868275336585`.
+- Final paper-style image: `D:\codex\workspace_code_v2\results_domain60_connected_1x50\traj_0000\process_plots\final_isosurface_iter_0050.png`.

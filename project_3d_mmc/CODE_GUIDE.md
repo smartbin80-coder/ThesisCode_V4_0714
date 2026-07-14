@@ -39,6 +39,7 @@
   - `"box"`: 高阶 p-norm 平滑盒状近似
 - 优化参数：`max_iter`, `optimizer_type`, `stop_on_convergence`
 - GNN 数据参数：`eta_candidates`, `save_graph`
+- 过程图参数：`save_process_plots`, `process_plot_density_threshold`
 - 批量数据参数：`min_components_for_dataset`, `max_components_for_dataset`
 - 载荷位置：`load_y`, `load_z`
 - 输出目录：`dataset_dir`, `results_dir`
@@ -162,9 +163,12 @@ alpha, beta, gamma
 
 - `create_initial_components(config)`
   - 为单次默认运行生成规则初始构件。
+  - 当前默认是 `6 × 2 × 2 = 24` 个组件，覆盖 `60 × 4 × 20` 设计域。
+  - 初始中心：x 从 `0.15*DL` 到 `0.90*DL`，y 为 `0.30*DW/0.70*DW`，z 为 `0.30*DH/0.70*DH`。
 
 - `create_random_components(config, rng)`
   - 为批量数据生成随机初始构件。
+  - 当前批量数据默认 `min_components_for_dataset=max_components_for_dataset=24`，组件数量固定为 24，位置和尺度仍随机以保留数据多样性。
 
 - `params_to_components(params, template_components)`
   - 将扁平参数数组恢复成构件列表。
@@ -480,6 +484,17 @@ seed
 num_components
 load_y
 load_z
+DL
+DW
+DH
+nelx
+nely
+nelz
+E0
+Emin
+nu
+volfrac
+max_iter
 ```
 
 训练建议：
@@ -520,6 +535,27 @@ load_z
 - `data.eta_label_index`: 离散 eta 类别
 - `data.eta_feasible_mask`: 哪些候选 eta 满足体积约束
 - `data.eta_failure_flag`: 是否全部候选失控
+- `data.DL/DW/DH`, `data.nelx/nely/nelz`, `data.E0/Emin/nu`, `data.volfrac`, `data.max_iter`: FEM evaluator 重建所需元数据；旧数据缺失时在线脚本回退到当前 `config.py`。
+
+## 15. 过程拓扑图输出
+
+`optimizer.py` 会在每条轨迹的 `results_dir/process_plots/` 下自动保存三张红色 3D 拓扑过程图：
+
+```text
+initial_iter_0000.png
+middle_iter_XXXX.png
+final_iter_XXXX.png
+```
+
+- `initial`: 初始组件状态，即 `iteration == 0`。
+- `middle`: 中途状态，即 `iteration == max(1, max_iter // 2)`。
+- `final`: 结束状态，即 `iteration == max_iter`。
+
+核心绘图函数在 `visualization.py`：
+
+- `plot_topology_process(densities, config, title, save_path, threshold)`
+
+批量数据生成时可用 `--no-process-plots` 关闭输出，或用 `--process-plot-threshold` 调整实体密度阈值。
 
 辅助函数：
 
@@ -531,7 +567,7 @@ load_z
 - 后续如果加入序列模型，可在这里扩展滑动窗口读取。
 - 训练/验证/测试必须按轨迹划分，不能随机按图划分。
 
-## 15. `split_by_trajectory.py`: 按轨迹划分数据集
+## 16. `split_by_trajectory.py`: 按轨迹划分数据集
 
 该文件用于防止时序数据泄漏。
 
@@ -560,7 +596,7 @@ val_trajectories.txt
 test_trajectories.txt
 ```
 
-## 16. `visualization.py`: 可视化
+## 17. `visualization.py`: 可视化
 
 该文件提供轻量级可视化工具。
 
@@ -583,7 +619,7 @@ test_trajectories.txt
 - 使用 Matplotlib `Agg` 后端，适合无 GUI 环境。
 - `_safe_savefig()` 会在保存图像失败时跳过，不中断主流程。
 
-## 17. `utils.py`: 通用工具
+## 18. `utils.py`: 通用工具
 
 主要函数：
 
@@ -605,7 +641,7 @@ test_trajectories.txt
 - `timer(func)`
   - 简单计时装饰器。
 
-## 18. 推荐维护顺序
+## 19. 推荐维护顺序
 
 如果后续继续扩展，建议按以下边界修改：
 
@@ -618,7 +654,7 @@ test_trajectories.txt
 7. 改批量数据生成：优先改 `generate_dataset.py`
 8. 改 GAT/元学习：优先改 `models.py`、`train_gnn_step.py`、`meta_learning.py`、`online_meta_controller.py`
 
-## 19. 当前已知限制
+## 20. 当前已知限制
 
 - MMA 是单体积约束版本，不是通用多约束 MMA。
 - `component_shape="box"` 是高阶 p-norm 平滑近似，不是精确不可导长方体边界。
@@ -627,7 +663,7 @@ test_trajectories.txt
 - 当前图样本是单步图，尚未实现连续多步序列样本。
 - 第一版组件级标签由图级 `eta_label` 广播，在线微调阶段才使用稀疏 FEM 真标签产生差异化监督。
 
-## 20. 快速命令参考
+## 21. 快速命令参考
 
 安装依赖：
 
@@ -676,3 +712,22 @@ MAML 风格元学习：
 ```bash
 python meta_learning.py --dataset-dir dataset --epochs 20
 ```
+
+## 2026-07-14 Connected MMC Isosurface Plotting
+
+The process plot output now writes two scientifically distinct views at each saved stage:
+
+```text
+initial_components_iter_0000.png
+initial_isosurface_iter_0000.png
+middle_components_iter_XXXX.png
+middle_isosurface_iter_XXXX.png
+final_components_iter_XXXX.png
+final_isosurface_iter_XXXX.png
+```
+
+- `*_components_*` is the component-debug view and renders each MMC component surface separately.
+- `*_isosurface_*` is the paper-style topology view and renders the true global implicit boundary `phi=0` extracted from the KS-aggregated MMC TDF with `skimage.measure.marching_cubes`.
+- The default isosurface sampling resolution is `isosurface_resolution = (240, 24, 80)`.
+- The default randomized 24-component initialization now follows an overlapped MBB-like skeleton, matching the MMC paper's idea that components are allowed to overlap and form a continuous structure through their TDF union.
+- Graph files now include `connected_to_load`, `spanning_ratio`, and `largest_component_ratio` for density-field connectivity diagnostics.
